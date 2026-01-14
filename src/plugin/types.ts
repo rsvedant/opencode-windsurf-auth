@@ -61,11 +61,27 @@ export const ModelEnum = {
   GPT_5: 340,
   GPT_5_HIGH: 341,
   GPT_5_CODEX: 346,
+  // GPT 5.1 Codex variants
+  GPT_5_1_CODEX_MINI_LOW: 385,
+  GPT_5_1_CODEX_MINI_MEDIUM: 386,
+  GPT_5_1_CODEX_MINI_HIGH: 387,
+  GPT_5_1_CODEX_LOW: 388,
+  GPT_5_1_CODEX_MEDIUM: 389,
+  GPT_5_1_CODEX_HIGH: 390,
+  GPT_5_1_CODEX_MAX_LOW: 395,
+  GPT_5_1_CODEX_MAX_MEDIUM: 396,
+  GPT_5_1_CODEX_MAX_HIGH: 397,
+  // GPT 5.2 variants
   GPT_5_2_NONE: 399,
   GPT_5_2_LOW: 400,
   GPT_5_2_MEDIUM: 401,
   GPT_5_2_HIGH: 402,
   GPT_5_2_XHIGH: 403,
+  GPT_5_2_NONE_PRIORITY: 404,
+  GPT_5_2_LOW_PRIORITY: 405,
+  GPT_5_2_MEDIUM_PRIORITY: 406,
+  GPT_5_2_HIGH_PRIORITY: 407,
+  GPT_5_2_XHIGH_PRIORITY: 408,
 
   // ============================================================================
   // O-Series (OpenAI Reasoning)
@@ -131,6 +147,7 @@ export const ModelEnum = {
   QWEN_2_5_72B_INSTRUCT: 180,
   QWEN_3_235B_INSTRUCT: 324,
   QWEN_3_CODER_480B_INSTRUCT: 325,
+  QWEN_3_CODER_480B_INSTRUCT_FAST: 327,
 
   // ============================================================================
   // XAI Grok

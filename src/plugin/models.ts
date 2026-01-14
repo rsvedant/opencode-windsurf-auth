@@ -95,6 +95,21 @@ const MODEL_NAME_TO_ENUM: Record<string, ModelEnumValue> = {
   'gpt-5-high': ModelEnum.GPT_5_HIGH,
   'gpt-5-codex': ModelEnum.GPT_5_CODEX,
   
+  // GPT 5.1 Codex variants
+  'gpt-5.1-codex-mini-low': ModelEnum.GPT_5_1_CODEX_MINI_LOW,
+  'gpt-5.1-codex-mini-medium': ModelEnum.GPT_5_1_CODEX_MINI_MEDIUM,
+  'gpt-5.1-codex-mini-high': ModelEnum.GPT_5_1_CODEX_MINI_HIGH,
+  'gpt-5.1-codex-mini': ModelEnum.GPT_5_1_CODEX_MINI_MEDIUM,
+  'gpt-5.1-codex-low': ModelEnum.GPT_5_1_CODEX_LOW,
+  'gpt-5.1-codex-medium': ModelEnum.GPT_5_1_CODEX_MEDIUM,
+  'gpt-5.1-codex-high': ModelEnum.GPT_5_1_CODEX_HIGH,
+  'gpt-5.1-codex': ModelEnum.GPT_5_1_CODEX_MEDIUM,
+  'gpt-5.1-codex-max-low': ModelEnum.GPT_5_1_CODEX_MAX_LOW,
+  'gpt-5.1-codex-max-medium': ModelEnum.GPT_5_1_CODEX_MAX_MEDIUM,
+  'gpt-5.1-codex-max-high': ModelEnum.GPT_5_1_CODEX_MAX_HIGH,
+  'gpt-5.1-codex-max': ModelEnum.GPT_5_1_CODEX_MAX_MEDIUM,
+  
+  // GPT 5.2 variants
   'gpt-5.2': ModelEnum.GPT_5_2_MEDIUM,
   'gpt-5-2': ModelEnum.GPT_5_2_MEDIUM,
   'gpt-5.2-low': ModelEnum.GPT_5_2_LOW,
@@ -103,6 +118,10 @@ const MODEL_NAME_TO_ENUM: Record<string, ModelEnumValue> = {
   'gpt-5-2-high': ModelEnum.GPT_5_2_HIGH,
   'gpt-5.2-xhigh': ModelEnum.GPT_5_2_XHIGH,
   'gpt-5-2-xhigh': ModelEnum.GPT_5_2_XHIGH,
+  'gpt-5.2-priority': ModelEnum.GPT_5_2_MEDIUM_PRIORITY,
+  'gpt-5.2-low-priority': ModelEnum.GPT_5_2_LOW_PRIORITY,
+  'gpt-5.2-high-priority': ModelEnum.GPT_5_2_HIGH_PRIORITY,
+  'gpt-5.2-xhigh-priority': ModelEnum.GPT_5_2_XHIGH_PRIORITY,
 
   // ============================================================================
   // O-Series (OpenAI Reasoning)
@@ -148,6 +167,22 @@ const MODEL_NAME_TO_ENUM: Record<string, ModelEnumValue> = {
   'gemini-3-0-pro-low': ModelEnum.GEMINI_3_0_PRO_LOW,
   'gemini-3.0-pro-high': ModelEnum.GEMINI_3_0_PRO_HIGH,
   'gemini-3-0-pro-high': ModelEnum.GEMINI_3_0_PRO_HIGH,
+  'gemini-3.0-pro': ModelEnum.GEMINI_3_0_PRO_MEDIUM,
+  'gemini-3-0-pro': ModelEnum.GEMINI_3_0_PRO_MEDIUM,
+  'gemini-3.0-pro-minimal': ModelEnum.GEMINI_3_0_PRO_MINIMAL,
+  'gemini-3-0-pro-minimal': ModelEnum.GEMINI_3_0_PRO_MINIMAL,
+  'gemini-3.0-pro-medium': ModelEnum.GEMINI_3_0_PRO_MEDIUM,
+  'gemini-3-0-pro-medium': ModelEnum.GEMINI_3_0_PRO_MEDIUM,
+  'gemini-3.0-flash': ModelEnum.GEMINI_3_0_FLASH_MEDIUM,
+  'gemini-3-0-flash': ModelEnum.GEMINI_3_0_FLASH_MEDIUM,
+  'gemini-3.0-flash-minimal': ModelEnum.GEMINI_3_0_FLASH_MINIMAL,
+  'gemini-3-0-flash-minimal': ModelEnum.GEMINI_3_0_FLASH_MINIMAL,
+  'gemini-3.0-flash-low': ModelEnum.GEMINI_3_0_FLASH_LOW,
+  'gemini-3-0-flash-low': ModelEnum.GEMINI_3_0_FLASH_LOW,
+  'gemini-3.0-flash-medium': ModelEnum.GEMINI_3_0_FLASH_MEDIUM,
+  'gemini-3-0-flash-medium': ModelEnum.GEMINI_3_0_FLASH_MEDIUM,
+  'gemini-3.0-flash-high': ModelEnum.GEMINI_3_0_FLASH_HIGH,
+  'gemini-3-0-flash-high': ModelEnum.GEMINI_3_0_FLASH_HIGH,
 
   // ============================================================================
   // DeepSeek
@@ -183,6 +218,8 @@ const MODEL_NAME_TO_ENUM: Record<string, ModelEnumValue> = {
   'qwen-2-5-72b': ModelEnum.QWEN_2_5_72B_INSTRUCT,
   'qwen-3-235b': ModelEnum.QWEN_3_235B_INSTRUCT,
   'qwen-3-coder-480b': ModelEnum.QWEN_3_CODER_480B_INSTRUCT,
+  'qwen-3-coder-480b-fast': ModelEnum.QWEN_3_CODER_480B_INSTRUCT_FAST,
+  'qwen-3-coder': ModelEnum.QWEN_3_CODER_480B_INSTRUCT,
 
   // ============================================================================
   // XAI Grok
@@ -202,7 +239,11 @@ const MODEL_NAME_TO_ENUM: Record<string, ModelEnumValue> = {
   'glm-4-5': ModelEnum.GLM_4_5,
   'glm-4.6': ModelEnum.GLM_4_6,
   'glm-4-6': ModelEnum.GLM_4_6,
+  'glm-4.7': ModelEnum.GLM_4_7,
+  'glm-4-7': ModelEnum.GLM_4_7,
   'minimax-m2': ModelEnum.MINIMAX_M2,
+  'minimax-m2.1': ModelEnum.MINIMAX_M2_1,
+  'minimax-m2-1': ModelEnum.MINIMAX_M2_1,
   'swe-1.5': ModelEnum.SWE_1_5,
   'swe-1-5': ModelEnum.SWE_1_5,
   'swe-1.5-thinking': ModelEnum.SWE_1_5_THINKING,
@@ -248,10 +289,14 @@ const ENUM_TO_MODEL_NAME: Partial<Record<ModelEnumValue, string>> = {
   [ModelEnum.GPT_5_LOW]: 'gpt-5-low',
   [ModelEnum.GPT_5_HIGH]: 'gpt-5-high',
   [ModelEnum.GPT_5_CODEX]: 'gpt-5-codex',
+  [ModelEnum.GPT_5_1_CODEX_MINI_MEDIUM]: 'gpt-5.1-codex-mini',
+  [ModelEnum.GPT_5_1_CODEX_MEDIUM]: 'gpt-5.1-codex',
+  [ModelEnum.GPT_5_1_CODEX_MAX_MEDIUM]: 'gpt-5.1-codex-max',
   [ModelEnum.GPT_5_2_LOW]: 'gpt-5.2-low',
   [ModelEnum.GPT_5_2_MEDIUM]: 'gpt-5.2',
   [ModelEnum.GPT_5_2_HIGH]: 'gpt-5.2-high',
   [ModelEnum.GPT_5_2_XHIGH]: 'gpt-5.2-xhigh',
+  [ModelEnum.GPT_5_2_MEDIUM_PRIORITY]: 'gpt-5.2-priority',
   
   // O-Series
   [ModelEnum.O1]: 'o1',
@@ -278,6 +323,9 @@ const ENUM_TO_MODEL_NAME: Partial<Record<ModelEnumValue, string>> = {
   [ModelEnum.GEMINI_2_5_FLASH_LITE]: 'gemini-2.5-flash-lite',
   [ModelEnum.GEMINI_3_0_PRO_LOW]: 'gemini-3.0-pro-low',
   [ModelEnum.GEMINI_3_0_PRO_HIGH]: 'gemini-3.0-pro-high',
+  [ModelEnum.GEMINI_3_0_PRO_MEDIUM]: 'gemini-3.0-pro',
+  [ModelEnum.GEMINI_3_0_FLASH_MEDIUM]: 'gemini-3.0-flash',
+  [ModelEnum.GEMINI_3_0_FLASH_HIGH]: 'gemini-3.0-flash-high',
   
   // DeepSeek
   [ModelEnum.DEEPSEEK_V3]: 'deepseek-v3',
@@ -299,6 +347,7 @@ const ENUM_TO_MODEL_NAME: Partial<Record<ModelEnumValue, string>> = {
   [ModelEnum.QWEN_2_5_72B_INSTRUCT]: 'qwen-2.5-72b',
   [ModelEnum.QWEN_3_235B_INSTRUCT]: 'qwen-3-235b',
   [ModelEnum.QWEN_3_CODER_480B_INSTRUCT]: 'qwen-3-coder-480b',
+  [ModelEnum.QWEN_3_CODER_480B_INSTRUCT_FAST]: 'qwen-3-coder-480b-fast',
   
   // Grok
   [ModelEnum.GROK_2]: 'grok-2',
@@ -312,7 +361,9 @@ const ENUM_TO_MODEL_NAME: Partial<Record<ModelEnumValue, string>> = {
   [ModelEnum.KIMI_K2_THINKING]: 'kimi-k2-thinking',
   [ModelEnum.GLM_4_5]: 'glm-4.5',
   [ModelEnum.GLM_4_6]: 'glm-4.6',
+  [ModelEnum.GLM_4_7]: 'glm-4.7',
   [ModelEnum.MINIMAX_M2]: 'minimax-m2',
+  [ModelEnum.MINIMAX_M2_1]: 'minimax-m2.1',
   [ModelEnum.SWE_1_5]: 'swe-1.5',
   [ModelEnum.SWE_1_5_THINKING]: 'swe-1.5-thinking',
 };

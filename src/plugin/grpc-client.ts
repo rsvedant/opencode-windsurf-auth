@@ -92,50 +92,54 @@ function encodeMetadata(apiKey: string, version: string): number[] {
 }
 
 /**
- * Encode a timestamp message
+ * Encode a FormattedChatMessage for the RawGetChatMessageRequest
+ * 
+ * Based on reverse engineering:
+ * Field 1: role (enum: ChatMessageSource)
+ * Field 2: header (string)
+ * Field 3: content (string)
+ * Field 4: footer (string)
  */
-function encodeTimestamp(): number[] {
-  const now = Date.now();
-  const seconds = Math.floor(now / 1000);
-  const nanos = (now % 1000) * 1000000;
-  return [...encodeVarintField(1, seconds), ...encodeVarintField(2, nanos)];
+function encodeFormattedChatMessage(role: number, content: string, header: string = '', footer: string = ''): number[] {
+  const result: number[] = [];
+  result.push(...encodeVarintField(1, role));      // role
+  if (header) {
+    result.push(...encodeString(2, header));       // header
+  }
+  result.push(...encodeString(3, content));        // content
+  if (footer) {
+    result.push(...encodeString(4, footer));       // footer
+  }
+  return result;
 }
 
 /**
- * Encode generic intent (text content)
+ * Map role string to ChatMessageSource enum value
  */
-function encodeIntentGeneric(text: string): number[] {
-  return [...encodeString(1, text)];
+function roleToSource(role: string): number {
+  switch (role) {
+    case 'user':
+      return ChatMessageSource.USER;
+    case 'assistant':
+      return ChatMessageSource.ASSISTANT;
+    case 'system':
+      return ChatMessageSource.SYSTEM;
+    case 'tool':
+      return ChatMessageSource.TOOL;
+    default:
+      return ChatMessageSource.USER;
+  }
 }
 
 /**
- * Encode chat message intent
- */
-function encodeChatMessageIntent(text: string): number[] {
-  const generic = encodeIntentGeneric(text);
-  return [...encodeMessage(1, generic)];
-}
-
-/**
- * Encode a full chat message
- */
-function encodeChatMessage(source: number, text: string): number[] {
-  const intent = encodeChatMessageIntent(text);
-  const msgId = crypto.randomUUID();
-  const convId = crypto.randomUUID();
-  const timestamp = encodeTimestamp();
-
-  return [
-    ...encodeString(1, msgId),              // message_id
-    ...encodeVarintField(2, source),        // source
-    ...encodeMessage(3, timestamp),         // timestamp
-    ...encodeString(4, convId),             // conversation_id
-    ...encodeMessage(5, intent),            // intent
-  ];
-}
-
-/**
- * Build the complete chat request buffer
+ * Build the complete chat request buffer using RawGetChatMessageRequest format
+ * 
+ * Based on reverse engineering, RawGetChatMessageRequest uses:
+ * Field 1: metadata (Metadata message)
+ * Field 2: chat_messages (repeated FormattedChatMessage)
+ * Field 3: system_prompt_override (string) - optional
+ * Field 4: chat_model (enum: Model)
+ * Field 5: chat_model_name (string) - optional
  */
 function buildChatRequest(
   apiKey: string,
@@ -145,17 +149,33 @@ function buildChatRequest(
 ): Buffer {
   const metadata = encodeMetadata(apiKey, version);
 
-  // Get the last user message as the prompt
-  const lastUserMessage = messages.filter((m) => m.role === 'user').pop();
-  const prompt = lastUserMessage?.content || '';
-
-  const chatMessage = encodeChatMessage(ChatMessageSource.USER, prompt);
-
-  const request = [
-    ...encodeMessage(1, metadata),       // metadata
-    ...encodeMessage(2, chatMessage),    // chat_message
-    ...encodeVarintField(4, modelEnum),  // model
-  ];
+  // Build the request with all messages
+  const request: number[] = [];
+  
+  // Field 1: metadata
+  request.push(...encodeMessage(1, metadata));
+  
+  // Field 2: chat_messages (repeated)
+  // Extract system message if present and handle separately
+  let systemPrompt = '';
+  for (const msg of messages) {
+    if (msg.role === 'system') {
+      systemPrompt = msg.content;
+    } else {
+      // Encode each message as FormattedChatMessage
+      const source = roleToSource(msg.role);
+      const formattedMsg = encodeFormattedChatMessage(source, msg.content);
+      request.push(...encodeMessage(2, formattedMsg));
+    }
+  }
+  
+  // Field 3: system_prompt_override (if we have a system message)
+  if (systemPrompt) {
+    request.push(...encodeString(3, systemPrompt));
+  }
+  
+  // Field 4: model enum
+  request.push(...encodeVarintField(4, modelEnum));
 
   const payload = Buffer.from(request);
 
