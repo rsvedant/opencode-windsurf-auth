@@ -73,44 +73,102 @@ function encodeVarintField(fieldNum: number, value: number | bigint): number[] {
 // ============================================================================
 
 /**
- * Build the metadata message for the request
+ * Generate a UUID for message and conversation IDs
  */
-function encodeMetadata(apiKey: string, version: string): number[] {
-  const requestId = BigInt(Date.now());
-  const sessionId = crypto.randomUUID();
-
-  return [
-    ...encodeString(1, 'windsurf-next'),      // ide_name
-    ...encodeString(2, version),               // ide_version
-    ...encodeString(3, apiKey),                // api_key
-    ...encodeString(4, 'en'),                  // locale
-    ...encodeString(7, version),               // extension_version
-    ...encodeVarintField(9, requestId),        // request_id
-    ...encodeString(10, sessionId),            // session_id
-    ...encodeString(12, 'windsurf'),           // client_name
-  ];
+function generateUUID(): string {
+  return crypto.randomUUID();
 }
 
 /**
- * Encode a FormattedChatMessage for the RawGetChatMessageRequest
- * 
- * Based on reverse engineering:
- * Field 1: role (enum: ChatMessageSource)
- * Field 2: header (string)
- * Field 3: content (string)
- * Field 4: footer (string)
+ * Encode a google.protobuf.Timestamp
+ * Field 1: seconds (int64)
+ * Field 2: nanos (int32)
  */
-function encodeFormattedChatMessage(role: number, content: string, header: string = '', footer: string = ''): number[] {
-  const result: number[] = [];
-  result.push(...encodeVarintField(1, role));      // role
-  if (header) {
-    result.push(...encodeString(2, header));       // header
+function encodeTimestamp(): number[] {
+  const now = Date.now();
+  const seconds = Math.floor(now / 1000);
+  const nanos = (now % 1000) * 1_000_000;
+  
+  const bytes: number[] = [];
+  bytes.push(...encodeVarintField(1, seconds));
+  if (nanos > 0) {
+    bytes.push(...encodeVarintField(2, nanos));
   }
-  result.push(...encodeString(3, content));        // content
-  if (footer) {
-    result.push(...encodeString(4, footer));       // footer
-  }
-  return result;
+  return bytes;
+}
+
+/**
+ * Encode IntentGeneric message
+ * Field 1: text (string)
+ */
+function encodeIntentGeneric(text: string): number[] {
+  return encodeString(1, text);
+}
+
+/**
+ * Encode ChatMessageIntent message
+ * Field 1: generic (IntentGeneric, oneof)
+ * Field 12: num_tokens (int32)
+ */
+function encodeChatMessageIntent(text: string): number[] {
+  const generic = encodeIntentGeneric(text);
+  return encodeMessage(1, generic);
+}
+
+/**
+ * Encode a ChatMessage for the RawGetChatMessageRequest
+ * 
+ * ChatMessage structure (from reverse engineering):
+ * Field 1: message_id (string, required)
+ * Field 2: source (enum: 1=USER, 2=SYSTEM)
+ * Field 3: timestamp (google.protobuf.Timestamp, required)
+ * Field 4: conversation_id (string, required)
+ * Field 5: intent (ChatMessageIntent, oneof content)
+ */
+function encodeChatMessage(content: string, source: number, conversationId: string): number[] {
+  const messageId = generateUUID();
+  const bytes: number[] = [];
+  
+  // Field 1: message_id (required)
+  bytes.push(...encodeString(1, messageId));
+  
+  // Field 2: source
+  bytes.push(...encodeVarintField(2, source));
+  
+  // Field 3: timestamp (required)
+  const timestamp = encodeTimestamp();
+  bytes.push(...encodeMessage(3, timestamp));
+  
+  // Field 4: conversation_id (required)
+  bytes.push(...encodeString(4, conversationId));
+  
+  // Field 5: intent (ChatMessageIntent)
+  const intent = encodeChatMessageIntent(content);
+  bytes.push(...encodeMessage(5, intent));
+  
+  return bytes;
+}
+
+/**
+ * Build the metadata message for the request
+ * 
+ * Metadata structure:
+ * Field 1: ide_name (string)
+ * Field 2: extension_version (string)
+ * Field 3: api_key (string, required)
+ * Field 4: locale (string)
+ * Field 7: ide_version (string)
+ * Field 12: extension_name (string)
+ */
+function encodeMetadata(apiKey: string, version: string): number[] {
+  return [
+    ...encodeString(1, 'windsurf'),             // ide_name
+    ...encodeString(2, version),                // extension_version
+    ...encodeString(3, apiKey),                 // api_key (required)
+    ...encodeString(4, 'en'),                   // locale
+    ...encodeString(7, version),                // ide_version
+    ...encodeString(12, 'windsurf'),            // extension_name
+  ];
 }
 
 /**
@@ -134,9 +192,9 @@ function roleToSource(role: string): number {
 /**
  * Build the complete chat request buffer using RawGetChatMessageRequest format
  * 
- * Based on reverse engineering, RawGetChatMessageRequest uses:
+ * RawGetChatMessageRequest structure:
  * Field 1: metadata (Metadata message)
- * Field 2: chat_messages (repeated FormattedChatMessage)
+ * Field 2: chat_messages (repeated ChatMessage)
  * Field 3: system_prompt_override (string) - optional
  * Field 4: chat_model (enum: Model)
  * Field 5: chat_model_name (string) - optional
@@ -148,6 +206,7 @@ function buildChatRequest(
   messages: ChatMessage[]
 ): Buffer {
   const metadata = encodeMetadata(apiKey, version);
+  const conversationId = generateUUID();
 
   // Build the request with all messages
   const request: number[] = [];
@@ -155,17 +214,17 @@ function buildChatRequest(
   // Field 1: metadata
   request.push(...encodeMessage(1, metadata));
   
-  // Field 2: chat_messages (repeated)
+  // Field 2: chat_messages (repeated ChatMessage)
   // Extract system message if present and handle separately
   let systemPrompt = '';
   for (const msg of messages) {
     if (msg.role === 'system') {
       systemPrompt = msg.content;
     } else {
-      // Encode each message as FormattedChatMessage
+      // Encode each message as ChatMessage with ChatMessageIntent
       const source = roleToSource(msg.role);
-      const formattedMsg = encodeFormattedChatMessage(source, msg.content);
-      request.push(...encodeMessage(2, formattedMsg));
+      const chatMsg = encodeChatMessage(msg.content, source, conversationId);
+      request.push(...encodeMessage(2, chatMsg));
     }
   }
   

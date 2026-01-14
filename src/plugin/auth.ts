@@ -4,7 +4,7 @@
  * Automatically discovers credentials from the running Windsurf language server:
  * - CSRF token from process arguments
  * - Port from process arguments (extension_server_port + 2)
- * - API key from ~/.codeium/config.json
+ * - API key from VSCode state database (~/Library/Application Support/Windsurf/User/globalStorage/state.vscdb)
  * - Version from process arguments
  */
 
@@ -53,7 +53,15 @@ export class WindsurfError extends Error {
 // Config Paths
 // ============================================================================
 
-const CONFIG_PATH = path.join(os.homedir(), '.codeium', 'config.json');
+// Paths for API key discovery
+const VSCODE_STATE_PATHS = {
+  darwin: path.join(os.homedir(), 'Library/Application Support/Windsurf/User/globalStorage/state.vscdb'),
+  linux: path.join(os.homedir(), '.config/Windsurf/User/globalStorage/state.vscdb'),
+  win32: path.join(os.homedir(), 'AppData/Roaming/Windsurf/User/globalStorage/state.vscdb'),
+} as const;
+
+// Legacy config path (fallback)
+const LEGACY_CONFIG_PATH = path.join(os.homedir(), '.codeium', 'config.json');
 
 // Platform-specific process names
 const LANGUAGE_SERVER_PATTERNS = {
@@ -170,44 +178,58 @@ export function getPort(): number {
 }
 
 /**
- * Read API key from ~/.codeium/config.json
+ * Read API key from VSCode state database (windsurfAuthStatus)
+ * 
+ * The API key is stored in the SQLite database at:
+ * ~/Library/Application Support/Windsurf/User/globalStorage/state.vscdb
+ * 
+ * It's stored in the 'windsurfAuthStatus' key as JSON containing apiKey.
  */
 export function getApiKey(): string {
-  if (!fs.existsSync(CONFIG_PATH)) {
+  const platform = process.platform as keyof typeof VSCODE_STATE_PATHS;
+  const statePath = VSCODE_STATE_PATHS[platform];
+  
+  if (!statePath) {
     throw new WindsurfError(
-      `Config file not found at ${CONFIG_PATH}. Please login to Windsurf first.`,
+      `Unsupported platform: ${process.platform}`,
       WindsurfErrorCode.API_KEY_MISSING
     );
   }
   
-  try {
-    const config = fs.readFileSync(CONFIG_PATH, 'utf8');
-    
-    // Try JSON parse first
+  // Try to get API key from VSCode state database
+  if (fs.existsSync(statePath)) {
     try {
+      const result = execSync(
+        `sqlite3 "${statePath}" "SELECT value FROM ItemTable WHERE key = 'windsurfAuthStatus';"`,
+        { encoding: 'utf8', timeout: 5000 }
+      ).trim();
+      
+      if (result) {
+        const parsed = JSON.parse(result);
+        if (parsed.apiKey) {
+          return parsed.apiKey;
+        }
+      }
+    } catch (error) {
+      // Fall through to legacy config
+    }
+  }
+  
+  // Try legacy config file
+  if (fs.existsSync(LEGACY_CONFIG_PATH)) {
+    try {
+      const config = fs.readFileSync(LEGACY_CONFIG_PATH, 'utf8');
       const parsed = JSON.parse(config);
       if (parsed.apiKey) {
         return parsed.apiKey;
       }
     } catch {
-      // Fall back to regex
+      // Fall through
     }
-    
-    // Regex fallback
-    const match = config.match(/"apiKey":"([^"]+)"/);
-    if (match?.[1]) {
-      return match[1];
-    }
-  } catch (error) {
-    throw new WindsurfError(
-      `Failed to read config file: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      WindsurfErrorCode.API_KEY_MISSING,
-      error
-    );
   }
   
   throw new WindsurfError(
-    'API key not found in config. Please login to Windsurf first.',
+    'API key not found. Please login to Windsurf first.',
     WindsurfErrorCode.API_KEY_MISSING
   );
 }
