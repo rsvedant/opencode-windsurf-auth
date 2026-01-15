@@ -38,7 +38,7 @@ Plugin intercepts OpenCode's `fetch()`, transforms to Windsurf gRPC format, retu
 ### 2. Credential Discovery from Process
 Credentials are extracted from the running Windsurf process - no user input required:
 - **CSRF Token**: From `--csrf_token` process argument
-- **Port**: From `--extension_server_port` + 2
+- **Port**: Dynamically discovered via `lsof -p <PID>` (offset varies due to `--random_port`; falls back to offset heuristics)
 - **API Key**: From `~/.codeium/config.json`
 
 ### 3. Manual Protobuf Encoding
@@ -49,6 +49,11 @@ function encodeString(fieldNum: number, str: string): number[] {
   return [(fieldNum << 3) | 2, ...encodeVarint(strBytes.length), ...strBytes];
 }
 ```
+
+Notes:
+- Assistant replies are encoded as plain text (field 5) while user/system/tool use intent wrapper.
+- We send both model enum and `chat_model_name` for fidelity.
+- Assistant/tool messages from history are filtered before sending to Windsurf.
 
 ### 4. Model Enum Mapping
 Model names are mapped to protobuf enum values extracted from Windsurf's extension.js:
@@ -77,7 +82,7 @@ const ModelEnum = {
 1. Windsurf spawns `language_server_macos` process with auth tokens in args
 2. Plugin extracts credentials: `ps aux | grep language_server_macos`
 3. gRPC requests go to `localhost:{port}/exa.language_server_pb.LanguageServerService/RawGetChatMessage`
-4. Responses are protobuf-encoded, plugin extracts text heuristically
+4. Responses are protobuf-encoded; text extracted via protobuf decoding (no heuristic parsing)
 
 ### gRPC Endpoint
 ```
@@ -90,7 +95,7 @@ Headers:
 
 ### Credential Locations
 - **CSRF Token**: `ps aux | grep language_server_macos | grep -oE '\-\-csrf_token\s+[a-f0-9-]+'`
-- **Port**: `extension_server_port + 2` from process args
+- **Port**: discovered via `lsof -p <PID>`; if missing, fallback offset from `--extension_server_port` (varies)
 - **API Key**: `~/.codeium/config.json`
 - **Version**: `--windsurf_version` from process args
 
@@ -131,8 +136,7 @@ grep -oE '[A-Z0-9_]+\s*=\s*[0-9]+' extension.js | grep -E 'CLAUDE|GPT|GEMINI|DEE
 ### Known Limitations
 - **Windsurf must be running** - No daemon mode
 - **macOS focused** - Linux/Windows paths need verification
-- **Heuristic text parsing** - Protobuf responses parsed heuristically
-- **No tool calling yet** - Basic chat completion only
+- **Tool calling** - Not yet implemented (chat-only)
 
 ## Documentation
 

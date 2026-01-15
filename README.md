@@ -11,7 +11,7 @@ OpenCode plugin for Windsurf/Codeium authentication - use Windsurf models in Ope
 
 ## Overview
 
-This plugin enables OpenCode users to access Windsurf/Codeium models by leveraging their existing Windsurf installation. It communicates directly with the **local Windsurf language server** via gRPC - no network traffic capture or OAuth flows required.
+This plugin enables OpenCode users to access Windsurf/Codeium models by leveraging their existing Windsurf installation. It communicates directly with the **local Windsurf language server** via gRPC—no network traffic capture or OAuth flows required.
 
 ## Prerequisites
 
@@ -28,14 +28,18 @@ bun add opencode-windsurf-codeium@beta
 
 ## OpenCode Configuration
 
-Add the following to your OpenCode config (typically `~/.config/opencode/config.json`). Pin the plugin if you want the beta tag:
+Add the following to your OpenCode config (typically `~/.config/opencode/config.json`). The plugin starts a local proxy server on port 42100 (falls back to a random free port and updates `chat.params` automatically):
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-windsurf-codeium@beta"],
+  "plugin": ["opencode-windsurf-codeium"],
   "provider": {
     "windsurf": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:42100/v1"
+      },
       "models": {
         "claude-4.5-opus": {
           "name": "Claude 4.5 Opus (Windsurf)",
@@ -91,7 +95,8 @@ src/
 1. **Credential Discovery**: Extracts CSRF token and port from the running `language_server_macos` process
 2. **API Key**: Reads from `~/.codeium/config.json`
 3. **gRPC Communication**: Sends requests to `localhost:{port}` using HTTP/2 gRPC protocol
-4. **Response Transformation**: Converts gRPC responses to OpenAI-compatible SSE format
+4. **Response Transformation**: Converts gRPC responses to OpenAI-compatible SSE format (assistant/tool turns are not replayed back to Windsurf)
+5. **Model Naming**: Sends both model enum and `chat_model_name` for fidelity with Windsurf’s expectations
 
 ### Supported Models (canonical names)
 
@@ -135,8 +140,7 @@ bun test
 
 - **Windsurf must be running** - The plugin communicates with the local language server
 - **macOS focus** - Linux/Windows paths need verification
-- **Response parsing** - Uses heuristic text extraction from protobuf (may miss edge cases)
-- **No tool calling yet** - Basic chat completion only
+- **Tool calling** - Not yet implemented (chat-only)
 
 ## Further Reading
 

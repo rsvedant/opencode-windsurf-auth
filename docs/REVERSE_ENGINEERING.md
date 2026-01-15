@@ -46,7 +46,7 @@ lsof -i -P -n -p <PID>
 # language_server 12345 vedant 25u IPv4 TCP 127.0.0.1:42102 (LISTEN)
 ```
 
-You'll see multiple ports. The gRPC endpoint is typically at `extension_server_port + 2`.
+You'll see multiple ports. We now resolve the gRPC endpoint via `lsof -p <PID>` (the offset can vary; common offsets are +2/+3/+4 relative to `extension_server_port`).
 
 ## Step 3: Extension Source Analysis
 
@@ -155,7 +155,7 @@ Test your findings:
 # Get credentials
 CSRF=$(ps aux | grep language_server_macos | grep -oE '\-\-csrf_token\s+[a-f0-9-]+' | awk '{print $2}')
 PORT=$(ps aux | grep language_server_macos | grep -oE '\-\-extension_server_port\s+[0-9]+' | awk '{print $2}')
-GRPC_PORT=$((PORT + 2))
+GRPC_PORT=$((PORT + 4))
 
 # Test the endpoint (will fail without proper protobuf, but confirms it's listening)
 curl -v -X POST "http://localhost:$GRPC_PORT/exa.language_server_pb.LanguageServerService/RawGetChatMessage" \
