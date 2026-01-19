@@ -749,6 +749,8 @@ async function ensureWindsurfProxyServer(): Promise<string> {
         hostname: WINDSURF_PROXY_HOST,
         port,
         fetch: handler,
+        // Keep connections alive longer to allow slow/long chat streams
+        idleTimeout: 300, // seconds
       });
     };
 
