@@ -15,6 +15,9 @@
  */
 
 import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import type { PluginInput, Hooks } from '@opencode-ai/plugin';
 import { getCredentials, isWindsurfRunning, WindsurfCredentials } from './plugin/auth.js';
 import { streamChatGenerator, ChatMessage } from './plugin/grpc-client.js';
@@ -25,6 +28,29 @@ import {
   resolveModel,
 } from './plugin/models.js';
 import { PLUGIN_ID } from './constants.js';
+
+// ============================================================================
+// Logging Helper
+// ============================================================================
+
+const LOG_FILE = path.join(os.homedir(), '.local', 'share', 'opencode', 'windsurf-plugin.log');
+
+function pluginLog(message: string): void {
+  const timestamp = new Date().toISOString();
+  const line = `[${timestamp}] ${message}\n`;
+  try {
+    // Ensure directory exists
+    const dir = path.dirname(LOG_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.appendFileSync(LOG_FILE, line);
+  } catch {
+    // Silently ignore logging errors
+  }
+  // Also log to console for cases where stdout is visible
+  console.log(`[windsurf-auth] ${message}`);
+}
 
 // ============================================================================
 // Types
@@ -652,11 +678,11 @@ async function ensureWindsurfProxyServer(): Promise<string> {
                 owned_by: 'windsurf',
                 ...(variants
                   ? {
-                      variants: Object.entries(variants).map(([name, meta]) => ({
-                        id: name,
-                        description: meta.description,
-                      })),
-                    }
+                    variants: Object.entries(variants).map(([name, meta]) => ({
+                      id: name,
+                      description: meta.description,
+                    })),
+                  }
                   : {}),
               };
             }),
@@ -758,6 +784,15 @@ async function ensureWindsurfProxyServer(): Promise<string> {
       const server = startServer(WINDSURF_PROXY_DEFAULT_PORT);
       const baseURL = `http://${WINDSURF_PROXY_HOST}:${server.port}/v1`;
       g[key].baseURL = baseURL;
+      pluginLog(`Proxy server started on port ${server.port}`);
+      if (isWindsurfRunning()) {
+        try {
+          const credentials = getCredentials();
+          pluginLog(`Connected to Windsurf language server on port ${credentials.port}`);
+        } catch (e) {
+          pluginLog(`Windsurf running but credentials not available: ${e instanceof Error ? e.message : e}`);
+        }
+      }
       return baseURL;
     } catch (error) {
       const code = (error as any)?.code;
@@ -781,6 +816,15 @@ async function ensureWindsurfProxyServer(): Promise<string> {
       const server = startServer(0);
       const baseURL = `http://${WINDSURF_PROXY_HOST}:${server.port}/v1`;
       g[key].baseURL = baseURL;
+      pluginLog(`Proxy server started on fallback port ${server.port}`);
+      if (isWindsurfRunning()) {
+        try {
+          const credentials = getCredentials();
+          pluginLog(`Connected to Windsurf language server on port ${credentials.port}`);
+        } catch (e) {
+          pluginLog(`Windsurf running but credentials not available: ${e instanceof Error ? e.message : e}`);
+        }
+      }
       return baseURL;
     }
   }
@@ -797,36 +841,36 @@ async function ensureWindsurfProxyServer(): Promise<string> {
  */
 export const createWindsurfPlugin =
   (providerId: string = PLUGIN_ID) =>
-  async (_context: PluginInput): Promise<Hooks> => {
-    // Start proxy server on plugin load
-    const proxyBaseURL = await ensureWindsurfProxyServer();
+    async (_context: PluginInput): Promise<Hooks> => {
+      // Start proxy server on plugin load
+      const proxyBaseURL = await ensureWindsurfProxyServer();
 
-    return {
-      auth: {
-        provider: providerId,
+      return {
+        auth: {
+          provider: providerId,
 
-        async loader(_getAuth: () => Promise<unknown>) {
-          // Return empty - we handle auth via the proxy server
-          return {};
+          async loader(_getAuth: () => Promise<unknown>) {
+            // Return empty - we handle auth via the proxy server
+            return {};
+          },
+
+          // No auth methods needed - we use Windsurf's existing auth
+          methods: [],
         },
 
-        // No auth methods needed - we use Windsurf's existing auth
-        methods: [],
-      },
+        // Dynamic baseURL injection (key pattern from cursor-auth)
+        async 'chat.params'(input: any, output: any) {
+          if (input.model?.providerID !== providerId) {
+            return;
+          }
 
-      // Dynamic baseURL injection (key pattern from cursor-auth)
-      async 'chat.params'(input: any, output: any) {
-        if (input.model?.providerID !== providerId) {
-          return;
-        }
-
-        // Inject the proxy server URL dynamically
-        output.options = output.options || {};
-        output.options.baseURL = proxyBaseURL;
-        output.options.apiKey = output.options.apiKey || 'windsurf-local';
-      },
+          // Inject the proxy server URL dynamically
+          output.options = output.options || {};
+          output.options.baseURL = proxyBaseURL;
+          output.options.apiKey = output.options.apiKey || 'windsurf-local';
+        },
+      };
     };
-  };
 
 /** Default Windsurf plugin export */
 export const WindsurfPlugin = createWindsurfPlugin();
