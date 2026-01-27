@@ -70,6 +70,13 @@ const LANGUAGE_SERVER_PATTERNS = {
   win32: 'language_server_windows',
 } as const;
 
+// Windsurf log directories for port discovery
+const WINDSURF_LOG_PATHS = {
+  darwin: path.join(os.homedir(), 'Library/Application Support/Windsurf/logs'),
+  linux: path.join(os.homedir(), '.config/Windsurf/logs'),
+  win32: path.join(os.homedir(), 'AppData/Roaming/Windsurf/logs'),
+} as const;
+
 // ============================================================================
 // Process Discovery
 // ============================================================================
@@ -84,10 +91,11 @@ function getLanguageServerPattern(): string {
 
 /**
  * Get process listing for language server
+ * Filters specifically for Windsurf's language server (not Antigravity's)
  */
 function getLanguageServerProcess(): string | null {
   const pattern = getLanguageServerPattern();
-  
+
   try {
     if (process.platform === 'win32') {
       // Windows: use WMIC
@@ -95,14 +103,19 @@ function getLanguageServerProcess(): string | null {
         `wmic process where "name like '%${pattern}%'" get CommandLine /format:list`,
         { encoding: 'utf8', timeout: 5000 }
       );
-      return output;
+      // Filter for Windsurf-specific lines (path contains /windsurf/ or \windsurf\ or has --ide_name windsurf)
+      const lines = output.split('\n').filter(line =>
+        line.includes('/windsurf/') || line.includes('\\windsurf\\') || line.includes('--ide_name windsurf')
+      );
+      return lines.length > 0 ? lines.join('\n') : null;
     } else {
-      // Unix-like: use ps
+      // Unix-like: use ps and filter for Windsurf-specific process
+      // Use /windsurf/ in path or --ide_name windsurf to avoid matching other language servers
       const output = execSync(
-        `ps aux | grep ${pattern}`,
+        `ps aux | grep ${pattern} | grep -E "/windsurf/|--ide_name windsurf" | grep -v grep`,
         { encoding: 'utf8', timeout: 5000 }
       );
-      return output;
+      return output.trim() || null;
     }
   } catch {
     return null;
@@ -114,19 +127,19 @@ function getLanguageServerProcess(): string | null {
  */
 export function getCSRFToken(): string {
   const processInfo = getLanguageServerProcess();
-  
+
   if (!processInfo) {
     throw new WindsurfError(
       'Windsurf language server not found. Is Windsurf running?',
       WindsurfErrorCode.NOT_RUNNING
     );
   }
-  
+
   const match = processInfo.match(/--csrf_token\s+([a-f0-9-]+)/);
   if (match?.[1]) {
     return match[1];
   }
-  
+
   throw new WindsurfError(
     'CSRF token not found in Windsurf process. Is Windsurf running?',
     WindsurfErrorCode.CSRF_MISSING
@@ -134,63 +147,47 @@ export function getCSRFToken(): string {
 }
 
 /**
- * Get the language server gRPC port dynamically using lsof
- * The port offset from extension_server_port varies (--random_port flag), so we use lsof
+ * Get the language server gRPC port from Windsurf log files
+ * Parses the most recent "Language server listening on random port at XXXXX" log entry
  */
 export function getPort(): number {
-  const processInfo = getLanguageServerProcess();
-  
-  if (!processInfo) {
+  const platform = process.platform as keyof typeof WINDSURF_LOG_PATHS;
+  const logsDir = WINDSURF_LOG_PATHS[platform];
+
+  if (!logsDir || !fs.existsSync(logsDir)) {
     throw new WindsurfError(
-      'Windsurf language server not found. Is Windsurf running?',
+      `Windsurf logs directory not found at ${logsDir}. Is Windsurf installed?`,
       WindsurfErrorCode.NOT_RUNNING
     );
   }
-  
-  // Extract PID from ps output (second column)
-  const pidMatch = processInfo.match(/^\s*\S+\s+(\d+)/);
-  const pid = pidMatch ? pidMatch[1] : null;
-  
-  // Get extension_server_port as a reference point
-  const portMatch = processInfo.match(/--extension_server_port\s+(\d+)/);
-  const extPort = portMatch ? parseInt(portMatch[1], 10) : null;
-  
-  // Use lsof to find actual listening ports for this specific PID
-  if (process.platform !== 'win32' && pid) {
-    try {
-      const lsof = execSync(
-        `lsof -p ${pid} -i -P -n 2>/dev/null | grep LISTEN`,
-        { encoding: 'utf8', timeout: 15000 }
-      );
-      
-      // Extract all listening ports
-      const portMatches = lsof.matchAll(/:(\d+)\s+\(LISTEN\)/g);
-      const ports = Array.from(portMatches).map(m => parseInt(m[1], 10));
-      
-      if (ports.length > 0) {
-        // If we have extension_server_port, prefer the port closest to it (usually +3)
-        if (extPort) {
-          // Sort by distance from extPort and pick the closest one > extPort
-          const candidatePorts = ports.filter(p => p > extPort).sort((a, b) => a - b);
-          if (candidatePorts.length > 0) {
-            return candidatePorts[0]; // Return the first port after extPort
-          }
-        }
-        // Otherwise just return the first listening port
-        return ports[0];
-      }
-    } catch {
-      // Fall through to offset-based approach
+
+  try {
+    // Search for port in log files and get the most recent entry
+    // Log line format: "2026-01-27 11:46:40.251 [info] ... Language server listening on random port at 41085"
+    let grepCmd: string;
+    if (process.platform === 'win32') {
+      // Windows: use findstr
+      grepCmd = `findstr /s /r "Language server listening on random port at" "${logsDir}\\*Windsurf.log"`;
+    } else {
+      // Unix-like: use grep with recursive search
+      grepCmd = `grep -rh "Language server listening on random port at" "${logsDir}" 2>/dev/null | sort | tail -1`;
     }
+
+    const output = execSync(grepCmd, { encoding: 'utf8', timeout: 10000 }).trim();
+
+    if (output) {
+      // Extract port from the log line
+      const portMatch = output.match(/Language server listening on random port at (\d+)/);
+      if (portMatch?.[1]) {
+        return parseInt(portMatch[1], 10);
+      }
+    }
+  } catch {
+    // Fall through to error
   }
-  
-  // Fallback: try common offsets (+3, +2, +4)
-  if (extPort) {
-    return extPort + 3;
-  }
-  
+
   throw new WindsurfError(
-    'Windsurf language server port not found. Is Windsurf running?',
+    'Windsurf language server port not found in logs. Is Windsurf running?',
     WindsurfErrorCode.NOT_RUNNING
   );
 }
@@ -206,14 +203,14 @@ export function getPort(): number {
 export function getApiKey(): string {
   const platform = process.platform as keyof typeof VSCODE_STATE_PATHS;
   const statePath = VSCODE_STATE_PATHS[platform];
-  
+
   if (!statePath) {
     throw new WindsurfError(
       `Unsupported platform: ${process.platform}`,
       WindsurfErrorCode.API_KEY_MISSING
     );
   }
-  
+
   // Try to get API key from VSCode state database
   if (fs.existsSync(statePath)) {
     try {
@@ -221,7 +218,7 @@ export function getApiKey(): string {
         `sqlite3 "${statePath}" "SELECT value FROM ItemTable WHERE key = 'windsurfAuthStatus';"`,
         { encoding: 'utf8', timeout: 5000 }
       ).trim();
-      
+
       if (result) {
         const parsed = JSON.parse(result);
         if (parsed.apiKey) {
@@ -232,7 +229,7 @@ export function getApiKey(): string {
       // Fall through to legacy config
     }
   }
-  
+
   // Try legacy config file
   if (fs.existsSync(LEGACY_CONFIG_PATH)) {
     try {
@@ -245,7 +242,7 @@ export function getApiKey(): string {
       // Fall through
     }
   }
-  
+
   throw new WindsurfError(
     'API key not found. Please login to Windsurf first.',
     WindsurfErrorCode.API_KEY_MISSING
@@ -257,7 +254,7 @@ export function getApiKey(): string {
  */
 export function getWindsurfVersion(): string {
   const processInfo = getLanguageServerProcess();
-  
+
   if (processInfo) {
     const match = processInfo.match(/--windsurf_version\s+([^\s]+)/);
     if (match) {
@@ -266,7 +263,7 @@ export function getWindsurfVersion(): string {
       return version;
     }
   }
-  
+
   // Default fallback version
   return '1.13.104';
 }
