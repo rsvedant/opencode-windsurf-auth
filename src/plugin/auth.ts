@@ -103,16 +103,19 @@ function getLanguageServerProcess(): string | null {
         `wmic process where "name like '%${pattern}%'" get CommandLine /format:list`,
         { encoding: 'utf8', timeout: 5000 }
       );
-      // Filter for Windsurf-specific lines (path contains /windsurf/ or \windsurf\ or has --ide_name windsurf)
-      const lines = output.split('\n').filter(line =>
-        line.includes('/windsurf/') || line.includes('\\windsurf\\') || line.includes('--ide_name windsurf')
-      );
+      // Filter for Windsurf-specific lines (case-insensitive)
+      // Path contains /windsurf/ or \windsurf\ or has --ide_name windsurf
+      const lowerOutput = output.toLowerCase();
+      const lines = output.split('\n').filter((line, idx) => {
+        const lowerLine = line.toLowerCase();
+        return lowerLine.includes('/windsurf/') || lowerLine.includes('\\windsurf\\') || lowerLine.includes('--ide_name windsurf');
+      });
       return lines.length > 0 ? lines.join('\n') : null;
     } else {
-      // Unix-like: use ps and filter for Windsurf-specific process
+      // Unix-like: use ps and filter for Windsurf-specific process (case-insensitive)
       // Use /windsurf/ in path or --ide_name windsurf to avoid matching other language servers
       const output = execSync(
-        `ps aux | grep ${pattern} | grep -E "/windsurf/|--ide_name windsurf" | grep -v grep`,
+        `ps aux | grep ${pattern} | grep -iE "/windsurf/|--ide_name windsurf" | grep -v grep`,
         { encoding: 'utf8', timeout: 5000 }
       );
       return output.trim() || null;
@@ -166,20 +169,30 @@ export function getPort(): number {
     // Log line format: "2026-01-27 11:46:40.251 [info] ... Language server listening on random port at 41085"
     let grepCmd: string;
     if (process.platform === 'win32') {
-      // Windows: use findstr
+      // Windows: use findstr to get all matches, then sort and pick the last (most recent)
       grepCmd = `findstr /s /r "Language server listening on random port at" "${logsDir}\\*Windsurf.log"`;
+      const output = execSync(grepCmd, { encoding: 'utf8', timeout: 10000 });
+      // Split into lines, filter empty, sort lexicographically (ISO timestamps make this valid), pick last
+      const lines = output.split('\n').filter(line => line.trim().length > 0);
+      if (lines.length > 0) {
+        lines.sort();
+        const lastLine = lines[lines.length - 1];
+        const portMatch = lastLine.match(/Language server listening on random port at (\d+)/);
+        if (portMatch?.[1]) {
+          return parseInt(portMatch[1], 10);
+        }
+      }
     } else {
       // Unix-like: use grep with recursive search
       grepCmd = `grep -rh "Language server listening on random port at" "${logsDir}" 2>/dev/null | sort | tail -1`;
-    }
+      const output = execSync(grepCmd, { encoding: 'utf8', timeout: 10000 }).trim();
 
-    const output = execSync(grepCmd, { encoding: 'utf8', timeout: 10000 }).trim();
-
-    if (output) {
-      // Extract port from the log line
-      const portMatch = output.match(/Language server listening on random port at (\d+)/);
-      if (portMatch?.[1]) {
-        return parseInt(portMatch[1], 10);
+      if (output) {
+        // Extract port from the log line
+        const portMatch = output.match(/Language server listening on random port at (\d+)/);
+        if (portMatch?.[1]) {
+          return parseInt(portMatch[1], 10);
+        }
       }
     }
   } catch {
