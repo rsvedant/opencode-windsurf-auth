@@ -109,7 +109,7 @@ Add the following to your Opencode config (typically `~/.config/opencode/config.
 After saving the config:
 
 ```bash
-opencode models list                                            # confirm models appear under windsurf/
+opencode models windsurf                                        # confirm models appear under windsurf/
 opencode chat --model=windsurf/claude-4.5-opus "Hello"          # quick smoke test
 ```
 
