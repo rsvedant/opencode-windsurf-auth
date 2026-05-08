@@ -110,7 +110,7 @@ After saving the config:
 
 ```bash
 opencode models windsurf                                        # confirm models appear under windsurf/
-opencode chat --model=windsurf/claude-4.5-opus "Hello"          # quick smoke test
+opencode run --model=windsurf/claude-4.5-opus "Hello"          # quick smoke test
 ```
 
 Keep Windsurf running and signed in—credentials are fetched live from the IDE process.
