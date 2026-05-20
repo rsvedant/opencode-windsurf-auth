@@ -10,17 +10,34 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
-// Default metadata fields if discovery fails (matches current spec/most common)
+// Default metadata field numbers. These reflect what Windsurf 2.x ships
+// (exa.codeium_common_pb.Metadata). The discovery routine below tries to
+// parse them out of extension.js to handle future field renumbering.
 export const DEFAULT_METADATA_FIELDS = {
-    api_key: 1,
-    ide_name: 2,
-    ide_version: 3,
-    extension_version: 4,
-    session_id: 5,
-    locale: 6,
+    ide_name: 1,
+    extension_version: 2,
+    api_key: 3,
+    locale: 4,
+    os: 5,
+    disable_telemetry: 6,
+    ide_version: 7,
+    hardware: 8,
+    request_id: 9,
+    session_id: 10,
+    extension_name: 12,
+    auth_source: 15,
+    ls_timestamp: 16,
+    extension_path: 17,
+    user_id: 20,
+    user_jwt: 21,
+    device_fingerprint: 24,
+    trigger_id: 25,
+    plan_name: 26,
+    ide_type: 28,
 };
 
 export type MetadataFields = typeof DEFAULT_METADATA_FIELDS;
+type MetadataFieldKey = keyof MetadataFields;
 
 let cachedFields: MetadataFields | null = null;
 
@@ -47,51 +64,40 @@ function findExtensionFile(): string | null {
 }
 
 /**
- * Analyze extension.js content to find Metadata field numbers
+ * Analyze extension.js content to find Metadata field numbers.
+ * Pulls every field we know how to fill — falls back to defaults for any
+ * not found.
  */
 function parseMetadataFields(content: string): MetadataFields | null {
-    // Look for field lists like: newFieldList(()=>[{no:1,name:"api_key",...},...])
+    // newFieldList(()=>[ {no:1,name:"ide_name",...}, ... ])
     const fieldLists = [...content.matchAll(/newFieldList\(\(\)=>\[(.*?)\]\)/g)];
 
     for (const match of fieldLists) {
         const listContent = match[1];
 
-        // The Metadata message must contain both api_key and ide_name
-        // AND must NOT contain "event_name" (which indicates a telemetry message)
-        if (listContent.includes('"api_key"') &&
+        // Identify the Metadata message: it has both api_key and ide_name,
+        // but is NOT a telemetry message (which carries event_name).
+        if (
+            listContent.includes('"api_key"') &&
             listContent.includes('"ide_name"') &&
-            !listContent.includes('"event_name"')) {
-            const fields = { ...DEFAULT_METADATA_FIELDS };
+            !listContent.includes('"event_name"')
+        ) {
+            const fields: MetadataFields = { ...DEFAULT_METADATA_FIELDS };
 
-            // regex to extract {no:X,name:"field_name"}
-            // Handles minified variations
-            const extractField = (name: string) => {
-                // pattern: {no:(\d+),name:"NAME"
-                const regex = new RegExp(`{no:(\\d+),name:"${name}"`);
+            const extractField = (name: string): number | null => {
+                const regex = new RegExp(`\\{no:(\\d+),name:"${name}"`);
                 const m = listContent.match(regex);
                 return m ? parseInt(m[1], 10) : null;
             };
 
-            const apiKey = extractField('api_key');
-            const ideName = extractField('ide_name');
+            const keys = Object.keys(fields) as MetadataFieldKey[];
+            for (const key of keys) {
+                const found = extractField(key);
+                if (found) fields[key] = found;
+            }
 
-            if (apiKey && ideName) {
-                fields.api_key = apiKey;
-                fields.ide_name = ideName;
-
-                // Try other fields
-                const ideVersion = extractField('ide_version');
-                if (ideVersion) fields.ide_version = ideVersion;
-
-                const extVersion = extractField('extension_version');
-                if (extVersion) fields.extension_version = extVersion;
-
-                const sessionId = extractField('session_id');
-                if (sessionId) fields.session_id = sessionId;
-
-                const locale = extractField('locale');
-                if (locale) fields.locale = locale;
-
+            // Only accept the parse if the two anchor fields were found.
+            if (extractField('api_key') && extractField('ide_name')) {
                 return fields;
             }
         }
@@ -116,11 +122,15 @@ export function getMetadataFields(): MetadataFields {
                 return cachedFields;
             }
         }
-    } catch (error) {
-        throw new Error('[Windsurf] Failed to discover extension fields: ' + error);
+    } catch {
+        // A corrupted or partially-downloaded extension.js shouldn't take the
+        // whole plugin down. Silently fall through to defaults — these are
+        // current-spec values, so chat still works as long as Windsurf
+        // hasn't renumbered any Metadata fields. No console output: this code
+        // ships inside the opencode runtime where stray logs would surface in
+        // the user's terminal.
     }
 
-    // Fallback to default
     cachedFields = DEFAULT_METADATA_FIELDS;
     return cachedFields;
 }

@@ -131,37 +131,76 @@ function encodeChatMessage(content: string, source: number, conversationId: stri
   return bytes;
 }
 
-/**
- * Build the metadata message for the request
- * 
- * Metadata structure:
- * Field 1: ide_name (string)
- * Field 2: extension_version (string)
- * Field 3: api_key (string, required)
- * Field 4: locale (string)
- * Field 7: ide_version (string)
- * Field 12: extension_name (string)
- */
 import { getMetadataFields } from './discovery.js';
 
 /**
- * Build the metadata message for the request
- * Dynamically maps fields using discovered extension.js values
+ * Monotonic per-process request_id (uint64 varint).
+ * Windsurf increments this for every Metadata it emits and the server uses it
+ * to correlate the call with the Cascade session that owns the API key.
  */
-function encodeMetadata(apiKey: string, version: string): number[] {
-  const fields = getMetadataFields();
+let nextRequestId = BigInt(Date.now());
 
-  return [
-    ...encodeString(fields.api_key, apiKey),                    // api_key
-    ...encodeString(fields.ide_name, 'windsurf'),               // ide_name
-    ...encodeString(fields.ide_version, version),               // ide_version
-    ...encodeString(fields.extension_version, version),         // extension_version
-    // Optional fields
-    ...(fields.session_id ? encodeString(fields.session_id, generateUUID()) : []),
-    ...(fields.locale ? encodeString(fields.locale, 'en') : []),
-    // Add extension_name equivalent if needed (often mapped to 12 in older versions or same as ide_name)
-    // For safety, we only encode defined discovered fields
-  ];
+/**
+ * Map process.platform → the OS string Windsurf reports.
+ * Windsurf uses "darwin"/"linux"/"windows" with no architecture suffix.
+ */
+function osString(): string {
+  switch (process.platform) {
+    case 'darwin':
+      return 'darwin';
+    case 'linux':
+      return 'linux';
+    case 'win32':
+      return 'windows';
+    default:
+      return String(process.platform);
+  }
+}
+
+/** Encode a google.protobuf.Timestamp body (seconds + nanos). */
+function encodeTimestampBody(): number[] {
+  const now = Date.now();
+  const seconds = Math.floor(now / 1000);
+  const nanos = (now % 1000) * 1_000_000;
+  const bytes: number[] = [...encodeVarintField(1, seconds)];
+  if (nanos > 0) bytes.push(...encodeVarintField(2, nanos));
+  return bytes;
+}
+
+/**
+ * Build the Metadata message Windsurf expects.
+ *
+ * Mirrors what `MetadataProvider.getMetadata()` ships in the bundled extension
+ * (extension.js): ide_name, ide_version, extension_name, extension_version,
+ * extension_path, api_key, session_id, request_id (BigInt), locale,
+ * device_fingerprint, plan_name, trigger_id, os, ide_type, ls_timestamp.
+ *
+ * Without the request_id / trigger_id / extension_name / os fields the server
+ * returns `failed_precondition: Cascade session error` for every chat model the
+ * user is otherwise allowed to use.
+ */
+function encodeMetadata(apiKey: string, version: string, sessionId: string): number[] {
+  const fields = getMetadataFields();
+  const requestId = nextRequestId++;
+  const triggerId = generateUUID();
+
+  const parts: number[] = [];
+  parts.push(...encodeString(fields.ide_name, 'windsurf'));
+  parts.push(...encodeString(fields.extension_version, version));
+  parts.push(...encodeString(fields.api_key, apiKey));
+  parts.push(...encodeString(fields.locale, 'en'));
+  parts.push(...encodeString(fields.os, osString()));
+  parts.push(...encodeString(fields.ide_version, version));
+  parts.push(...encodeVarintField(fields.request_id, requestId));
+  parts.push(...encodeString(fields.session_id, sessionId));
+  parts.push(...encodeString(fields.extension_name, 'windsurf'));
+  parts.push(...encodeMessage(fields.ls_timestamp, encodeTimestampBody()));
+  parts.push(...encodeString(fields.extension_path, ''));
+  parts.push(...encodeString(fields.device_fingerprint, ''));
+  parts.push(...encodeString(fields.trigger_id, triggerId));
+  parts.push(...encodeString(fields.plan_name, 'Unset'));
+  parts.push(...encodeString(fields.ide_type, 'windsurf'));
+  return parts;
 }
 
 /**
@@ -199,7 +238,8 @@ function buildChatRequest(
   messages: ChatMessage[],
   modelName?: string
 ): Buffer {
-  const metadata = encodeMetadata(apiKey, version);
+  const sessionId = generateUUID();
+  const metadata = encodeMetadata(apiKey, version, sessionId);
   const conversationId = generateUUID();
 
   // Build the request with all messages
