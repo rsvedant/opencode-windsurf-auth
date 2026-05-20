@@ -2,6 +2,11 @@
 
 This document explains how you would discover Windsurf's local gRPC architecture through reverse engineering, even if mitmproxy shows nothing useful.
 
+> **Windsurf 2.x specifics**: this file covers the original discovery process
+> (still useful for orientation). For the Cascade-era gotchas — server-gated
+> `RawGetChatMessage`, string-UID model identification, monotonic `request_id`,
+> `.pb` trajectory cleanup, etc. — see [CASCADE_PROTOCOL.md](CASCADE_PROTOCOL.md).
+
 ## Why mitmproxy Failed
 
 mitmproxy only captures HTTP/HTTPS traffic going through the network stack. Windsurf's language server communicates via **localhost gRPC** - traffic that never leaves the machine and bypasses any system proxy.
@@ -23,10 +28,13 @@ ps aux | grep -i language_server
 # vedant  12345  0.5  1.2 language_server_macos --csrf_token abc123 --extension_server_port 42100
 ```
 
-The process arguments are a goldmine:
-- `--csrf_token` → Authentication token
-- `--extension_server_port` → Base port for communication
-- `--windsurf_version` → Version info
+The process arguments are still useful, but **Windsurf 1.9577+ no longer exposes the CSRF token via CLI args**. Instead:
+- `--extension_server_port` → base port (gRPC chat port is a separate listening socket on the same PID, discovered via `lsof`)
+- `--windsurf_version` → version reported to the server
+- `--stdin_initial_metadata` → signals that bootstrap data (including the CSRF token) is piped in via stdin
+- `WINDSURF_CSRF_TOKEN=<uuid>` env var → the **current** location of the CSRF token. Read with `ps -E -ww -p <PID>` on macOS, `/proc/<PID>/environ` on Linux, or `Get-Process -Id <PID> | … | EnvironmentVariables` on Windows.
+
+Older builds passed `--csrf_token <uuid>` on the command line; the plugin probes the env-var location first and falls back to the legacy arg.
 
 ## Step 2: Network Port Discovery
 

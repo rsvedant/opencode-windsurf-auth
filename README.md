@@ -130,12 +130,12 @@ src/
 
 ### How It Works
 
-1. **Credential Discovery**: Extracts CSRF token and port from the running `language_server_macos` process
-2. **API Key**: Reads from `~/.codeium/config.json`
-3. **gRPC Communication**: Sends requests to `localhost:{port}` using HTTP/2 gRPC protocol
-4. **Response Transformation**: Converts gRPC responses to OpenAI-compatible SSE format (assistant/tool turns are not replayed back to Windsurf)
-5. **Model Naming**: Sends both model enum and `chat_model_name` for fidelity with Windsurf’s expectations
-6. **Tool Planning**: When `tools` are provided, we build a tool-calling prompt (with system messages) and ask Windsurf to produce `tool_calls`/final text. Tool execution and MCP tool registry stay on OpenCode’s side.
+1. **Credential Discovery**: Pulls the CSRF token from the `WINDSURF_CSRF_TOKEN` env var on the running `language_server_*` process (Windsurf 1.9577+ removed the `--csrf_token` CLI arg). Port is discovered via `lsof`/`Get-NetTCPConnection` on the same PID.
+2. **API Key**: Read from Windsurf's VSCode state DB (`state.vscdb`, key `windsurfAuthStatus`). Supports the current `devin-session-token$<JWT>` format as well as `sk-ws-01-*` and `cog_*`.
+3. **gRPC Communication**: HTTP/2 gRPC to `http://localhost:{port}`. Full Metadata payload (15 fields, including `request_id`, `trigger_id`, `ls_timestamp`, `device_fingerprint`, `plan_name`, `ide_type`) — anything less triggers the server's "Cascade session" gate.
+4. **Cascade Flow**: `InitializeCascadePanelState` → `StartCascade` → `SendUserCascadeMessage` (with `requested_model_uid = "MODEL_*"`) → poll `GetCascadeTranscriptForTrajectoryId` → archive. The plugin uses Cascade because Windsurf 2.x rejects `RawGetChatMessage` for non-IDE clients.
+5. **Streaming**: Deltas of each Assistant message are emitted as the transcript grows; multi-step planner runs (Assistant → Tool → Assistant) are concatenated in order.
+6. **Tool Planning**: When `tools` are provided, the plugin builds a structured tool-calling prompt (with system messages preserved) and asks Windsurf to produce `tool_calls`/final text. Tool execution and the MCP tool registry stay on OpenCode's side.
 
 ### Supported Models (canonical names)
 
@@ -155,7 +155,25 @@ src/
 
 **Grok (xAI)**: `grok-2`, `grok-3`, `grok-3-mini`, `grok-code-fast`.
 
-**Specialty & Proprietary**: `mistral-7b`, `kimi-k2`, `kimi-k2-thinking`, `glm-4.5`, `glm-4.5-fast`, `glm-4.6`, `glm-4.6-fast`, `glm-4.7`, `glm-4.7-fast`, `minimax-m2`, `minimax-m2.1`, `swe-1.5`, `swe-1.5-thinking`, `swe-1.5-slow`.
+**Specialty & Proprietary**: `mistral-7b`, `kimi-k2`, `kimi-k2-thinking`, `kimi-k2.5`, `kimi-k2.6`, `glm-4.5`, `glm-4.5-fast`, `glm-4.6`, `glm-4.6-fast`, `glm-4.7`, `glm-4.7-fast`, `glm-5.1`, `minimax-m2`, `minimax-m2.1`, `minimax-m2.5`, `swe-1.5`, `swe-1.5-thinking`, `swe-1.5-slow`, `swe-1.6` (variants: `fast`), `gpt-oss-120b`, `gpt-5.2-codex` (`low`/`medium`/`high`/`xhigh` + `-priority` tiers), `deepseek-v4`.
+
+### Cognition-era string-UID models
+
+Windsurf 2.x has shifted away from numeric proto-enum identifiers toward string `model_uid`s the server publishes via `GetUserStatus`. These models have no entry in the bundled `extension.js` proto enum, so the only way to enumerate them is to query the running language_server (see [docs/CASCADE_PROTOCOL.md](docs/CASCADE_PROTOCOL.md) §3 for the protocol).
+
+The plugin maps them to canonical names you can use in OpenCode config:
+
+- **Claude Opus 4.7** — `claude-opus-4.7` with variants `low`/`medium`/`high`/`xhigh`/`max` and `*-fast` priority-routing twins (10 total).
+- **Claude Opus 4.6** — `claude-opus-4.6` with variants `thinking`, `1m`, `thinking-1m`, `fast`, `thinking-fast`.
+- **Claude Sonnet 4.6** — `claude-sonnet-4.6` with `thinking`, `1m`, `thinking-1m`.
+- **Gemini 3.5 Flash** — `gemini-3.5-flash` with `minimal`/`low`/`medium`/`high`.
+- **Gemini 3.1 Pro** — `gemini-3.1-pro` with `low`/`high`.
+- **GPT-5.4** — `gpt-5.4` with `none`/`low`/`medium`/`high`/`xhigh` + `-priority` twins.
+- **GPT-5.4 Mini** — `gpt-5.4-mini` with `low`/`medium`/`high`/`xhigh`.
+- **GPT-5.5** — `gpt-5.5` with the same shape as 5.4.
+- **GPT-5.3 Codex** — `gpt-5.3-codex` with `low`/`medium`/`high`/`xhigh` + `-priority` twins.
+
+The available list **varies per account**. Call `GET http://127.0.0.1:42100/v1/models` once the plugin is loaded to see what's advertised for you specifically.
 
 Aliases (e.g., `gpt-5.2-low-priority`) are also accepted. Variants live under `provider.windsurf.models[model].variants`; thinking/non-thinking are distinct models.
 
@@ -182,8 +200,9 @@ bun test
 
 ## Further Reading
 
+- [docs/CASCADE_PROTOCOL.md](https://github.com/rsvedant/opencode-windsurf-auth/blob/master/docs/CASCADE_PROTOCOL.md) – **Windsurf 2.x findings.** Why `RawGetChatMessage` is dead, how the Cascade flow works, why model UIDs are now strings instead of proto enum numbers, metadata field requirements, etc.
 - [docs/WINDSURF_API_SPEC.md](https://github.com/rsvedant/opencode-windsurf-auth/blob/master/docs/WINDSURF_API_SPEC.md) – gRPC endpoints & protobuf notes
-- [docs/REVERSE_ENGINEERING.md](https://github.com/rsvedant/opencode-windsurf-auth/blob/master/docs/REVERSE_ENGINEERING.md) – credential discovery + tooling
+- [docs/REVERSE_ENGINEERING.md](https://github.com/rsvedant/opencode-windsurf-auth/blob/master/docs/REVERSE_ENGINEERING.md) – credential discovery + tooling (Windsurf 1.x era; supplement with CASCADE_PROTOCOL.md)
 - [opencode-antigravity-auth](https://github.com/NoeFabris/opencode-antigravity-auth) – related project
 
 ## License

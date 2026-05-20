@@ -37,24 +37,29 @@ Plugin intercepts OpenCode's `fetch()`, transforms to Windsurf gRPC format, retu
 
 ### 2. Credential Discovery from Process
 Credentials are extracted from the running Windsurf process - no user input required:
-- **CSRF Token**: From `--csrf_token` process argument
-- **Port**: Dynamically discovered via `lsof -p <PID>` (offset varies due to `--random_port`; falls back to offset heuristics)
-- **API Key**: From `~/.codeium/config.json`
+- **CSRF Token**: `WINDSURF_CSRF_TOKEN` env var on the `language_server_*` process. Windsurf 1.9577+ removed this from CLI args; we read it via `ps -E -ww -p <PID>` on macOS, `/proc/<PID>/environ` on Linux, PowerShell on Windows. Falls back to the legacy `--csrf_token` CLI arg for older builds.
+- **Port**: Discovered via `lsof -p <PID> -iTCP -sTCP:LISTEN` (Windows: `Get-NetTCPConnection -OwningProcess <PID>`). We pick the lowest listening port strictly greater than `--extension_server_port`.
+- **API Key**: Read from the VSCode state DB (`Library/Application Support/Windsurf/User/globalStorage/state.vscdb`, key `windsurfAuthStatus`). The current format is `devin-session-token$<JWT>` (Cognition era); older builds also accepted `sk-ws-01-*` and `cog_*`.
+
+Credentials are resolved in `getCredentials()` from a *single* `getLanguageServerPIDs()` lookup so a Windsurf restart racing between the calls can't yield a token from PID A and a port from PID B.
 
 ### 3. Manual Protobuf Encoding
-No protobuf library needed - messages are encoded manually:
+No protobuf library needed - messages are encoded manually. Field tags must be varint-encoded (single-byte tags are only safe for fields 0–15; the Metadata message uses fields up to 28 and `CascadePlannerConfig.requested_model_uid` is field 35):
 ```typescript
+function encodeTag(fieldNum: number, wireType: number): number[] {
+  return encodeVarint((fieldNum << 3) | wireType); // <-- varint, not a single byte
+}
 function encodeString(fieldNum: number, str: string): number[] {
   const strBytes = Buffer.from(str, 'utf8');
-  return [(fieldNum << 3) | 2, ...encodeVarint(strBytes.length), ...strBytes];
+  return [...encodeTag(fieldNum, 2), ...encodeVarint(strBytes.length), ...strBytes];
 }
 ```
 
 Notes:
-- Assistant replies are encoded as plain text (field 5) while user/system/tool use intent wrapper.
-- We send both model enum and `chat_model_name` for fidelity.
-- Assistant/tool messages from history are filtered before sending to Windsurf.
-- When `tools` are provided, we build a tool prompt (with system messages) and ask Windsurf to produce `tool_calls`/final text. Tool execution remains in OpenCode (MCP/tool registry).
+- `Metadata` (`exa.codeium_common_pb.Metadata`) populates 15 fields the IDE itself sends: `ide_name`, `extension_version`, `api_key`, `locale`, `os`, `ide_version`, `request_id` (uint64 varint, monotonic), `session_id`, `extension_name`, `ls_timestamp`, `extension_path`, `device_fingerprint`, `trigger_id`, `plan_name`, `ide_type`. Without these the server returns `failed_precondition: Cascade session error`.
+- `discovery.ts` parses field numbers from `extension.js` at runtime so they keep working if Windsurf renumbers them.
+- All assistant/tool roles from OpenCode history are preserved (flattened into the prompt with role-tagged sections); the tools path uses `buildToolPrompt` which preserves structured context.
+- Tool execution stays in OpenCode (MCP/tool registry). The plugin asks Windsurf to produce `tool_calls`/final text only.
 
 ### 4. Model Enum Mapping
 Model names are mapped to protobuf enum values extracted from Windsurf's extension.js:
@@ -79,15 +84,24 @@ const ModelEnum = {
 
 ## Windsurf Architecture
 
-### How It Works
-1. Windsurf spawns `language_server_macos` process with auth tokens in args
-2. Plugin extracts credentials: `ps aux | grep language_server_macos`
-3. gRPC requests go to `localhost:{port}/exa.language_server_pb.LanguageServerService/RawGetChatMessage`
-4. Responses are protobuf-encoded; text extracted via protobuf decoding (no heuristic parsing)
+### How It Works (Windsurf 2.x — Cascade flow)
+
+Windsurf 2.x rejects `RawGetChatMessage` with `failed_precondition: Cascade session error` for any client that isn't an active Cascade session. The plugin drives the same RPC sequence the IDE uses:
+
+1. **`InitializeCascadePanelState`** — once per CSRF token. Registers the plugin as a panel client. Cached by `creds.csrfToken` so a Windsurf restart (which rotates the token) re-initializes automatically.
+2. **`StartCascade`** — per conversation. We omit `base_trajectory_identifier` so the server creates a fresh trajectory; setting `last_active_doc=true` would attach to whichever Cascade the IDE is currently showing. Returns a `cascade_id`.
+3. **`SendUserCascadeMessage`** — sends the prompt. Requires `CascadeConfig.PlannerConfig` populated with:
+   - `planner_type_config.conversational = {}` (field 2 oneof)
+   - `requested_model_uid = "MODEL_<NAME>"` (field 35, **two-byte tag** — single-byte encoding silently corrupts the payload)
+4. **`GetCascadeTranscriptForTrajectoryId`** — polled every 500 ms. Returns a human-readable transcript with `=== MESSAGE N - <Role> ===` headers. We track emitted bytes per Assistant message index, stream deltas as the model writes, and terminate when both byte count and step count are steady for 4 ticks.
+5. **`ArchiveCascadeTrajectory`** — best-effort cleanup at the end of each call. Without this every chat leaves a ~20 MB `.pb` file in `~/.codeium/windsurf/cascade/`.
+
+The legacy `RawGetChatMessage` path is still in the codebase but unused — kept only because the encoders are shared and the request shape is documented for anyone debugging against older Windsurf.
 
 ### gRPC Endpoint
+All RPCs hit the local language_server at `http://127.0.0.1:{port}` over HTTP/2 with gRPC framing. Service path:
 ```
-POST http://localhost:{port}/exa.language_server_pb.LanguageServerService/RawGetChatMessage
+POST http://localhost:{port}/exa.language_server_pb.LanguageServerService/<MethodName>
 Headers:
   content-type: application/grpc
   te: trailers
@@ -142,8 +156,9 @@ grep -oE '[A-Z0-9_]+\s*=\s*[0-9]+' extension.js | grep -E 'CLAUDE|GPT|GEMINI|DEE
 ## Documentation
 
 - [README.md](README.md) - Installation & usage
-- [docs/WINDSURF_API_SPEC.md](docs/WINDSURF_API_SPEC.md) - API reference
-- [docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md) - How the gRPC approach was discovered
+- [docs/CASCADE_PROTOCOL.md](docs/CASCADE_PROTOCOL.md) - **Read this first if you're touching the wire format.** Windsurf 2.x Cascade-flow gotchas: session gate, string-UID models, metadata field requirements, transcript parsing, `.pb` cleanup, etc. All non-obvious findings live here.
+- [docs/WINDSURF_API_SPEC.md](docs/WINDSURF_API_SPEC.md) - API reference (wire format still accurate; the `RawGetChatMessage` flow it describes is dead — see CASCADE_PROTOCOL.md)
+- [docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md) - How the original gRPC approach was discovered
 
 ## Related Projects
 
