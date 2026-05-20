@@ -1,11 +1,9 @@
 /**
  * Windsurf Credential Discovery Module
- * 
- * Automatically discovers credentials from the running Windsurf language server:
- * - CSRF token from process arguments
- * - Port from process arguments (extension_server_port + 2)
- * - API key from VSCode state database (~/Library/Application Support/Windsurf/User/globalStorage/state.vscdb)
- * - Version from process arguments
+ *
+ * Windsurf 1.9577+ moved the CSRF token from --csrf_token (CLI arg) to the
+ * WINDSURF_CSRF_TOKEN environment variable passed to the language_server child.
+ * We probe env vars first, then fall back to the legacy CLI arg.
  */
 
 import { execSync } from 'child_process';
@@ -63,12 +61,18 @@ const VSCODE_STATE_PATHS = {
 // Legacy config path (fallback)
 const LEGACY_CONFIG_PATH = path.join(os.homedir(), '.codeium', 'config.json');
 
-// Platform-specific process names
+// Platform-specific process names. Binaries currently used by Windsurf 2.x:
+//   macOS:   language_server_macos_arm | language_server_macos_x64
+//   Linux:   language_server_linux_x64 | language_server_linux_arm64
+//   Windows: language_server_windows_x64.exe
+// The substring `language_server_<platform>` matches all variants.
 const LANGUAGE_SERVER_PATTERNS = {
   darwin: 'language_server_macos',
   linux: 'language_server_linux',
   win32: 'language_server_windows',
 } as const;
+
+const CSRF_ENV_VAR = 'WINDSURF_CSRF_TOKEN';
 
 // ============================================================================
 // Process Discovery
@@ -83,112 +87,263 @@ function getLanguageServerPattern(): string {
 }
 
 /**
- * Get process listing for language server
+ * Get the running language-server command line (used for arg-based discovery).
+ * Returns the full `ps`-style command line(s) joined by newlines, or null.
  */
 function getLanguageServerProcess(): string | null {
   const pattern = getLanguageServerPattern();
-  
+
   try {
     if (process.platform === 'win32') {
-      // Windows: use WMIC
+      // Windows 11 22H2+ removed wmic. Use PowerShell + CIM instead.
+      const psCmd =
+        `Get-CimInstance Win32_Process -Filter "Name LIKE '%${pattern}%'" ` +
+        `| Select-Object ProcessId,CommandLine ` +
+        `| Format-Table -HideTableHeaders -Wrap | Out-String -Width 4096`;
       const output = execSync(
-        `wmic process where "name like '%${pattern}%'" get CommandLine /format:list`,
-        { encoding: 'utf8', timeout: 5000 }
-      );
-      return output;
-    } else {
-      // Unix-like: use ps
-      const output = execSync(
-        `ps aux | grep ${pattern}`,
+        `powershell -NoProfile -ExecutionPolicy Bypass -Command "${psCmd}"`,
         { encoding: 'utf8', timeout: 5000 }
       );
       return output;
     }
+
+    // ps aux gives CLI args including --csrf_token for legacy Windsurf builds.
+    // -ww disables truncation so very long arg lists aren't cut off.
+    const output = execSync(
+      `ps -ww -axo pid,command | grep ${pattern} | grep -v grep`,
+      { encoding: 'utf8', timeout: 5000 }
+    );
+    return output || null;
   } catch {
     return null;
   }
 }
 
 /**
- * Extract CSRF token from running Windsurf language server process
+ * Pull the PID(s) of every running language_server_<platform> binary that
+ * belongs to Windsurf (not Antigravity / other Codeium IDEs).
+ *
+ * Returns the most recently-started PID — that's the active language server
+ * even when stale ones linger after a restart.
+ */
+function getLanguageServerPIDs(): number[] {
+  const pattern = getLanguageServerPattern();
+  try {
+    if (process.platform === 'win32') {
+      const psCmd =
+        `Get-CimInstance Win32_Process -Filter "Name LIKE '%${pattern}%'" ` +
+        `| Where-Object { $_.CommandLine -match '/windsurf/|--ide_name windsurf' } ` +
+        `| Sort-Object CreationDate -Descending ` +
+        `| ForEach-Object { $_.ProcessId }`;
+      const output = execSync(
+        `powershell -NoProfile -ExecutionPolicy Bypass -Command "${psCmd}"`,
+        { encoding: 'utf8', timeout: 5000 }
+      );
+      return output
+        .split(/\r?\n/)
+        .map((line) => parseInt(line.trim(), 10))
+        .filter((n) => Number.isFinite(n) && n > 0);
+    }
+
+    // Constrain to processes whose command line contains the Windsurf binary
+    // path or the `--ide_name windsurf` flag, avoiding Antigravity collisions.
+    const output = execSync(
+      `ps -ww -axo pid,lstart,command | grep ${pattern} | grep -iE '/windsurf/|--ide_name windsurf' | grep -v grep`,
+      { encoding: 'utf8', timeout: 5000 }
+    );
+    const rows = output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    // Sort by lstart descending — most recent first. lstart format is
+    // "DDD MMM DD HH:MM:SS YYYY" which sorts lexicographically by date when
+    // we delegate to Date parsing.
+    const parsed = rows
+      .map((row) => {
+        // PID is the first token; lstart is fields 2-6; command starts at 7.
+        const tokens = row.split(/\s+/);
+        const pid = parseInt(tokens[0], 10);
+        const lstart = tokens.slice(1, 6).join(' ');
+        const startedAt = Date.parse(lstart);
+        return { pid, startedAt };
+      })
+      .filter((p) => Number.isFinite(p.pid) && p.pid > 0)
+      .sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+
+    return parsed.map((p) => p.pid);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Read all environment variables for the given PID.
+ * Returns a flat string the caller can regex-match (`KEY=value` per entry).
+ */
+function getProcessEnvironment(pid: number): string {
+  try {
+    if (process.platform === 'darwin') {
+      // ps -E -ww -p <pid> prints env vars after the command line.
+      // -ww prevents truncation.
+      const output = execSync(`ps -E -ww -p ${pid}`, {
+        encoding: 'utf8',
+        timeout: 5000,
+      });
+      return output;
+    }
+    if (process.platform === 'linux') {
+      // /proc/<pid>/environ is null-separated. Requires same-user access.
+      const buf = fs.readFileSync(`/proc/${pid}/environ`);
+      return buf.toString('utf8').replace(/\0/g, '\n');
+    }
+    if (process.platform === 'win32') {
+      // No reliable cross-Windows way to read another process's env via
+      // PowerShell without a native helper. Best effort: probe the current
+      // user's environment (Windsurf launches the language server as the
+      // same user, so any vars Windsurf exported globally will be present).
+      const output = execSync(
+        `powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem env: | ForEach-Object { ($_.Name) + '=' + ($_.Value) }"`,
+        { encoding: 'utf8', timeout: 5000 }
+      );
+      return output;
+    }
+  } catch {
+    // fall through
+  }
+  return '';
+}
+
+/**
+ * Discover the Windsurf CSRF token.
+ *
+ * Order of attempts:
+ *   1. WINDSURF_CSRF_TOKEN env var on the language_server process
+ *      (Windsurf 1.9577+ — current behavior).
+ *   2. `--csrf_token <uuid>` CLI arg (legacy Windsurf builds).
  */
 export function getCSRFToken(): string {
-  const processInfo = getLanguageServerProcess();
-  
-  if (!processInfo) {
+  return getCSRFTokenForPIDs(getLanguageServerPIDs());
+}
+
+/**
+ * Internal: extract the CSRF token from a known PID list. Used by
+ * `getCredentials` so token + port + version all resolve against the same
+ * language_server process (otherwise a restart racing between the two calls
+ * leaves us with token from PID A and port from PID B).
+ */
+function getCSRFTokenForPIDs(pids: number[]): string {
+  if (pids.length === 0 && !getLanguageServerProcess()) {
     throw new WindsurfError(
       'Windsurf language server not found. Is Windsurf running?',
       WindsurfErrorCode.NOT_RUNNING
     );
   }
-  
-  const match = processInfo.match(/--csrf_token\s+([a-f0-9-]+)/);
-  if (match?.[1]) {
-    return match[1];
+
+  // Anchor the env-var match so we don't fall for a coincidental substring
+  // (e.g. a logging env var that includes the literal "WINDSURF_CSRF_TOKEN=").
+  const envRegex = new RegExp(`\\b${CSRF_ENV_VAR}=([0-9a-f-]{36})`, 'i');
+
+  // Newest PID first — see getLanguageServerPIDs.
+  for (const pid of pids) {
+    const env = getProcessEnvironment(pid);
+    if (!env) continue;
+    const m = env.match(envRegex);
+    if (m?.[1]) return m[1];
   }
-  
+
+  // Legacy CLI arg fallback for older Windsurf builds.
+  const processInfo = getLanguageServerProcess();
+  if (processInfo) {
+    const argMatch = processInfo.match(/--csrf_token\s+([0-9a-f-]{36})/i);
+    if (argMatch?.[1]) return argMatch[1];
+  }
+
   throw new WindsurfError(
-    'CSRF token not found in Windsurf process. Is Windsurf running?',
+    'CSRF token not found via WINDSURF_CSRF_TOKEN env var or --csrf_token arg. ' +
+      'Restart Windsurf and re-run; ensure the plugin runs as the same user.',
     WindsurfErrorCode.CSRF_MISSING
   );
 }
 
 /**
- * Get the language server gRPC port dynamically using lsof
- * The port offset from extension_server_port varies (--random_port flag), so we use lsof
+ * Get the language server gRPC port.
+ *
+ * Windsurf uses `--random_port` so the gRPC listener is always one of the
+ * PID's listening sockets — `lsof` is the source of truth. We pick the
+ * lowest listening port strictly greater than `--extension_server_port`,
+ * which is the historical convention for the chat-server slot.
  */
 export function getPort(): number {
-  const processInfo = getLanguageServerProcess();
-  
-  if (!processInfo) {
+  return getPortForPIDs(getLanguageServerPIDs());
+}
+
+function getPortForPIDs(pids: number[], processInfo: string | null = getLanguageServerProcess()): number {
+  if (pids.length === 0 && !processInfo) {
     throw new WindsurfError(
       'Windsurf language server not found. Is Windsurf running?',
       WindsurfErrorCode.NOT_RUNNING
     );
   }
-  
-  // Extract PID from ps output (second column)
-  const pidMatch = processInfo.match(/^\s*\S+\s+(\d+)/);
-  const pid = pidMatch ? pidMatch[1] : null;
-  
-  // Get extension_server_port as a reference point
-  const portMatch = processInfo.match(/--extension_server_port\s+(\d+)/);
-  const extPort = portMatch ? parseInt(portMatch[1], 10) : null;
-  
-  // Use lsof to find actual listening ports for this specific PID
-  if (process.platform !== 'win32' && pid) {
-    try {
-      const lsof = execSync(
-        `lsof -p ${pid} -i -P -n 2>/dev/null | grep LISTEN`,
-        { encoding: 'utf8', timeout: 15000 }
-      );
-      
-      // Extract all listening ports
-      const portMatches = lsof.matchAll(/:(\d+)\s+\(LISTEN\)/g);
-      const ports = Array.from(portMatches).map(m => parseInt(m[1], 10));
-      
-      if (ports.length > 0) {
-        // If we have extension_server_port, prefer the port closest to it (usually +3)
+
+  // extension_server_port anchors the search to ports beyond the index server.
+  const extPortMatch = processInfo?.match(/--extension_server_port\s+(\d+)/);
+  const extPort = extPortMatch ? parseInt(extPortMatch[1], 10) : null;
+
+  if (process.platform !== 'win32') {
+    for (const pid of pids) {
+      try {
+        const lsof = execSync(`lsof -p ${pid} -iTCP -sTCP:LISTEN -P -n`, {
+          encoding: 'utf8',
+          timeout: 15000,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+
+        const ports = Array.from(lsof.matchAll(/:(\d+)\s+\(LISTEN\)/g)).map((m) =>
+          parseInt(m[1], 10)
+        );
+        if (ports.length === 0) continue;
+
         if (extPort) {
-          // Sort by distance from extPort and pick the closest one > extPort
-          const candidatePorts = ports.filter(p => p > extPort).sort((a, b) => a - b);
-          if (candidatePorts.length > 0) {
-            return candidatePorts[0]; // Return the first port after extPort
-          }
+          const above = ports.filter((p) => p > extPort).sort((a, b) => a - b);
+          if (above.length > 0) return above[0];
         }
-        // Otherwise just return the first listening port
-        return ports[0];
+        return ports.sort((a, b) => a - b)[0];
+      } catch {
+        // try the next PID
       }
-    } catch {
-      // Fall through to offset-based approach
+    }
+  } else {
+    // Windows: PowerShell Get-NetTCPConnection scoped by PID.
+    for (const pid of pids) {
+      try {
+        const output = execSync(
+          `powershell -NoProfile -ExecutionPolicy Bypass -Command ` +
+            `"Get-NetTCPConnection -OwningProcess ${pid} -State Listen -ErrorAction SilentlyContinue | ForEach-Object { $_.LocalPort }"`,
+          { encoding: 'utf8', timeout: 15000 }
+        );
+        const ports = output
+          .split(/\r?\n/)
+          .map((s) => parseInt(s.trim(), 10))
+          .filter((n) => Number.isFinite(n) && n > 0);
+        if (ports.length === 0) continue;
+        if (extPort) {
+          const above = ports.filter((p) => p > extPort).sort((a, b) => a - b);
+          if (above.length > 0) return above[0];
+        }
+        return ports.sort((a, b) => a - b)[0];
+      } catch {
+        // try next PID
+      }
     }
   }
-  
-  // Fallback: try common offsets (+3, +2, +4)
+
+  // Final fallback — best-effort offset from extension_server_port. Windsurf
+  // historically gave the chat server a slot between extPort+3 and extPort+8.
   if (extPort) {
     return extPort + 3;
   }
-  
+
   throw new WindsurfError(
     'Windsurf language server port not found. Is Windsurf running?',
     WindsurfErrorCode.NOT_RUNNING
@@ -253,22 +408,24 @@ export function getApiKey(): string {
 }
 
 /**
- * Get Windsurf version from process arguments
+ * Get Windsurf version from process arguments.
+ *
+ * Default fallback updated to match Windsurf 2.x naming. The exact value only
+ * matters when the running language server is unreachable, in which case the
+ * request will fail anyway — but we want a non-stale default.
  */
 export function getWindsurfVersion(): string {
-  const processInfo = getLanguageServerProcess();
-  
+  return getWindsurfVersionFromProcessInfo(getLanguageServerProcess());
+}
+
+function getWindsurfVersionFromProcessInfo(processInfo: string | null): string {
   if (processInfo) {
     const match = processInfo.match(/--windsurf_version\s+([^\s]+)/);
     if (match) {
-      // Extract just the version number (before + if present)
-      const version = match[1].split('+')[0];
-      return version;
+      return match[1].split('+')[0];
     }
   }
-  
-  // Default fallback version
-  return '1.13.104';
+  return '2.0.0';
 }
 
 // ============================================================================
@@ -276,14 +433,23 @@ export function getWindsurfVersion(): string {
 // ============================================================================
 
 /**
- * Get all credentials needed to communicate with Windsurf
+ * Get all credentials needed to communicate with Windsurf.
+ *
+ * Resolves the language_server PID set once and reuses it for both the CSRF
+ * and port lookups — otherwise a Windsurf restart racing between the two
+ * calls would yield a CSRF for PID A and a port for PID B.
  */
 export function getCredentials(): WindsurfCredentials {
+  // Resolve the language_server's process state ONCE so a restart racing
+  // between sub-lookups can't yield a CSRF token for PID A, port for PID B,
+  // and version from PID C. PIDs are sorted newest-first by lstart.
+  const pids = getLanguageServerPIDs();
+  const processInfo = getLanguageServerProcess();
   return {
-    csrfToken: getCSRFToken(),
-    port: getPort(),
+    csrfToken: getCSRFTokenForPIDs(pids),
+    port: getPortForPIDs(pids, processInfo),
     apiKey: getApiKey(),
-    version: getWindsurfVersion(),
+    version: getWindsurfVersionFromProcessInfo(processInfo),
   };
 }
 
