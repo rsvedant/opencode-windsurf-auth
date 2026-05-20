@@ -10,6 +10,7 @@ import * as crypto from 'crypto';
 import { ChatMessageSource } from './types.js';
 import { resolveModel } from './models.js';
 import { WindsurfCredentials, WindsurfError, WindsurfErrorCode } from './auth.js';
+import { streamCascadeChat } from './cascade-client.js';
 
 // ============================================================================
 // Types
@@ -32,12 +33,10 @@ export interface StreamChatOptions {
 // ============================================================================
 // Protobuf Encoding Helpers
 // ============================================================================
-//
-// Shared in src/plugin/protobuf.ts so production code and the diagnostic
-// scripts in tests/live/ use exactly the same implementation. The previous
-// inline copy here used a single-byte tag (`(fieldNum << 3) | 2`) which
-// silently corrupted any field with number >= 16 — see protobuf.ts for the
-// historical context.
+
+// Shared protobuf encoders live in protobuf.ts so prod and tests/live use
+// exactly the same implementation. See historical notes in that file for
+// why single-byte tag encoding broke fields >= 16.
 import {
   encodeString,
   encodeMessage,
@@ -290,7 +289,7 @@ function buildChatRequest(
 // Response Parsing (Protobuf Decoding)
 // ============================================================================
 
-// decodeVarint comes from the shared protobuf module too.
+// decodeVarint is re-exported from the shared protobuf module above.
 import { decodeVarint } from './protobuf.js';
 
 /**
@@ -486,8 +485,22 @@ export function streamChat(
   credentials: WindsurfCredentials,
   options: StreamChatOptions
 ): Promise<string> {
+  // NOTE: streamChat targets the legacy RawGetChatMessage RPC, which Windsurf
+  // 2.x rejects with "Cascade session error". Kept as an opt-in for users on
+  // older Windsurf builds and as an integration test seam. Production callers
+  // should use streamChatGenerator (Cascade flow). Cognition-era string-UID
+  // models have no proto enum and don't work via this path at all.
   const { csrfToken, port, apiKey, version } = credentials;
   const resolved = resolveModel(options.model);
+  if (resolved.enumValue === undefined) {
+    return Promise.reject(
+      new WindsurfError(
+        `streamChat does not support string-UID models like "${resolved.modelUid}"; ` +
+          `use streamChatGenerator instead.`,
+        WindsurfErrorCode.STREAM_ERROR
+      )
+    );
+  }
   const modelEnum = resolved.enumValue;
   const modelName = resolved.variant ? `${resolved.modelId}:${resolved.variant}` : resolved.modelId;
   const body = buildChatRequest(apiKey, version, modelEnum, options.messages, modelName);
@@ -567,101 +580,85 @@ export function streamChat(
 }
 
 /**
- * Stream chat completion using async generator
- * 
- * Yields text chunks as they arrive, for use with SSE streaming.
- * 
- * @param credentials - Windsurf credentials
- * @param options - Chat options (model and messages)
- * @yields Text chunks as they arrive
+ * Stream a chat completion through Windsurf's Cascade flow.
+ *
+ * The Cascade flow is the only path that works on Windsurf 2.x — RawGetChatMessage
+ * is blocked by a server-side "Cascade session" gate even when all metadata is
+ * populated correctly. See cascade-client.ts for the RPC sequence.
+ *
+ * Multi-message conversations are flattened into a single prompt with role-prefixed
+ * sections. The Cascade trajectory is the source of truth; we don't preserve
+ * conversation state across calls because OpenCode hands us the full history every
+ * turn anyway.
  */
 export async function* streamChatGenerator(
   credentials: WindsurfCredentials,
-  options: Pick<StreamChatOptions, 'model' | 'messages'>
+  options: Pick<StreamChatOptions, 'model' | 'messages'> & { signal?: AbortSignal }
 ): AsyncGenerator<string, void, unknown> {
-  const { csrfToken, port, apiKey, version } = credentials;
   const resolved = resolveModel(options.model);
-  const modelEnum = resolved.enumValue;
-  const modelName = resolved.variant ? `${resolved.modelId}:${resolved.variant}` : resolved.modelId;
-  const body = buildChatRequest(apiKey, version, modelEnum, options.messages, modelName);
+  const prompt = flattenMessagesToPrompt(options.messages);
 
-  const client = http2.connect(`http://localhost:${port}`);
-
-  const chunkQueue: string[] = [];
-  let done = false;
-  let error: Error | null = null;
-  let resolveWait: (() => void) | null = null;
-
-  client.on('error', (err) => {
-    error = new WindsurfError(
-      `Connection failed: ${err.message}`,
-      WindsurfErrorCode.CONNECTION_FAILED,
-      err
-    );
-    done = true;
-    resolveWait?.();
+  // resolved.modelUid is the canonical server identifier — either a legacy
+  // "MODEL_X" enum-name or a Cognition-era string UID (e.g.
+  // "claude-opus-4-7-medium"). Send it directly.
+  yield* streamCascadeChat(credentials, {
+    prompt,
+    modelUid: resolved.modelUid,
+    signal: options.signal,
   });
+}
 
-  const req = client.request({
-    ':method': 'POST',
-    ':path': '/exa.language_server_pb.LanguageServerService/RawGetChatMessage',
-    'content-type': 'application/grpc',
-    'te': 'trailers',
-    'x-codeium-csrf-token': csrfToken,
-  });
-
-  req.on('data', (chunk: Buffer) => {
-    const text = extractTextFromChunk(chunk);
-    if (text) {
-      chunkQueue.push(text);
-      resolveWait?.();
-    }
-  });
-
-  req.on('trailers', (trailers) => {
-    const status = trailers['grpc-status'];
-    if (status !== '0') {
-      const message = trailers['grpc-message'];
-      error = new WindsurfError(
-        `gRPC error ${status}: ${message ? decodeURIComponent(message as string) : 'Unknown error'}`,
-        WindsurfErrorCode.STREAM_ERROR
-      );
-    }
-  });
-
-  req.on('end', () => {
-    done = true;
-    client.close();
-    resolveWait?.();
-  });
-
-  req.on('error', (err) => {
-    error = new WindsurfError(
-      `Request failed: ${err.message}`,
-      WindsurfErrorCode.STREAM_ERROR,
-      err
-    );
-    done = true;
-    client.close();
-    resolveWait?.();
-  });
-
-  req.write(body);
-  req.end();
-
-  // Yield chunks as they arrive
-  while (!done || chunkQueue.length > 0) {
-    if (chunkQueue.length > 0) {
-      yield chunkQueue.shift()!;
-    } else if (!done) {
-      await new Promise<void>((resolve) => {
-        resolveWait = resolve;
-      });
-      resolveWait = null;
+/**
+ * Collapse a multi-turn OpenAI-style message array into a single prompt the
+ * Cascade can accept.
+ *
+ * Each user message is sent as the cascade's input; system messages become an
+ * "Instructions:" preamble, and prior assistant turns are rendered as
+ * "Previous assistant reply:" sections so the model has chat context.
+ */
+function flattenMessagesToPrompt(messages: ChatMessage[]): string {
+  // Find the *index* of the final user message — that becomes the primary
+  // prompt and everything before it (in original order) becomes history.
+  // The previous implementation collapsed historyParts in role-grouped order
+  // rather than chronological order, which silently swapped earlier
+  // user/assistant turns when interleaved.
+  let primaryUserIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'user') {
+      primaryUserIndex = i;
+      break;
     }
   }
 
-  if (error) {
-    throw error;
+  const systemParts: string[] = [];
+  const historyParts: string[] = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    if (i === primaryUserIndex) continue;
+    const msg = messages[i];
+    const content = (msg.content ?? '').trim();
+    if (!content) continue;
+    if (msg.role === 'system') {
+      // System messages aren't strictly ordered with user/assistant turns,
+      // but for the common "top-level system" case this collapses cleanly.
+      // If a flow injects a mid-conversation system message, it still ends
+      // up in the preamble — losing positional intent but not content.
+      systemParts.push(content);
+    } else if (msg.role === 'assistant') {
+      historyParts.push(`Previous assistant reply:\n${content}`);
+    } else if (msg.role === 'tool') {
+      historyParts.push(`Previous tool result:\n${content}`);
+    } else if (msg.role === 'user') {
+      historyParts.push(`Previous user message:\n${content}`);
+    }
   }
+
+  const lastUser =
+    primaryUserIndex >= 0 ? (messages[primaryUserIndex].content ?? '').trim() : '';
+
+  const out: string[] = [];
+  if (systemParts.length) out.push(`Instructions:\n${systemParts.join('\n\n')}`);
+  if (historyParts.length) out.push(historyParts.join('\n\n'));
+  if (lastUser) out.push(lastUser);
+  return out.join('\n\n');
 }

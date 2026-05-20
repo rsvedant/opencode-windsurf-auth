@@ -173,9 +173,25 @@ export const ModelEnum = {
   MINIMAX_M2: 368,
   MINIMAX_M2_1: 419,
   SWE_1_5: 359,
+  SWE_1_5_REDIRECT: 361,
   SWE_1_5_THINKING: 369,
   SWE_1_5_SLOW: 377,
+  SWE_1_6: 420,
+  SWE_1_6_FAST: 421,
   CLAUDE_4_5_SONNET_THINKING_1M: 371,
+
+  // GPT-OSS open-weights
+  GPT_OSS_120B: 326,
+
+  // GPT 5.2 Codex variants (added in Windsurf 2.3.x)
+  GPT_5_2_CODEX_LOW: 422,
+  GPT_5_2_CODEX_MEDIUM: 423,
+  GPT_5_2_CODEX_HIGH: 424,
+  GPT_5_2_CODEX_XHIGH: 425,
+  GPT_5_2_CODEX_LOW_PRIORITY: 426,
+  GPT_5_2_CODEX_MEDIUM_PRIORITY: 427,
+  GPT_5_2_CODEX_HIGH_PRIORITY: 428,
+  GPT_5_2_CODEX_XHIGH_PRIORITY: 429,
 } as const;
 
 export type ModelEnumValue = (typeof ModelEnum)[keyof typeof ModelEnum];

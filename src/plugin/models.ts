@@ -11,24 +11,65 @@
 
 import { ModelEnum, type ModelEnumValue } from './types.js';
 
+/**
+ * Reverse lookup: enum number → "MODEL_<NAME>" string.
+ *
+ * The Cascade flow's CascadePlannerConfig.requested_model_uid expects the
+ * proto3 enum name (e.g. "MODEL_CLAUDE_4_5_OPUS"), not the integer value, so
+ * we derive it from the `ModelEnum` keys we already maintain.
+ */
+const ENUM_VALUE_TO_NAME: Map<number, string> = (() => {
+  const map = new Map<number, string>();
+  for (const [key, value] of Object.entries(ModelEnum)) {
+    if (typeof value === 'number') {
+      map.set(value, `MODEL_${key}`);
+    }
+  }
+  return map;
+})();
+
+export function enumNameForValue(value: ModelEnumValue): string {
+  return ENUM_VALUE_TO_NAME.get(value as number) ?? 'MODEL_UNSPECIFIED';
+}
+
 // ==========================================================================
 // Variant-aware catalog
 // ==========================================================================
 
 type VariantName = string;
 
+/**
+ * A Windsurf model is identified server-side by its `model_uid` string. Two
+ * coexisting formats:
+ *   - Legacy proto-enum models: uid is the enum-name string, e.g.
+ *     `"MODEL_CLAUDE_4_5_OPUS"`. We can also derive this from the numeric
+ *     `enumValue` via `MODEL_${key}`.
+ *   - New string-UID models (claude-opus-4-7-*, gemini-3-5-flash-*, …):
+ *     server returns them with proto-enum `0`. The uid IS the identifier and
+ *     there's no enum number to fall back to.
+ *
+ * VariantMeta lets either path supply a uid; the legacy `enumValue` is kept
+ * optional for callers that still want the integer.
+ */
 type VariantMeta = {
   /** Human-oriented hint used in /v1/models variants payload */
   description?: string;
-  /** Maps to Windsurf enum */
-  enumValue: ModelEnumValue;
+  /**
+   * Server `model_uid` string (sent in `CascadePlannerConfig.requested_model_uid`).
+   * If omitted but `enumValue` is set, the resolver derives it as `MODEL_${key}`.
+   */
+  modelUid?: string;
+  /** Optional proto enum value — used for legacy callers and debugging. */
+  enumValue?: ModelEnumValue;
 };
 
 type ModelCatalogEntry = {
-  /** Canonical model id exposed to OpenCode */
+  /** Canonical model id exposed to OpenCode (e.g. "claude-opus-4.7") */
   id: string;
-  /** Default enum when no variant supplied */
-  defaultEnum: ModelEnumValue;
+  /** Default proto enum when no variant supplied (legacy path) */
+  defaultEnum?: ModelEnumValue;
+  /** Default server uid when no variant supplied (new path) */
+  defaultUid?: string;
   /** Optional variants keyed by variant name (lowercase) */
   variants?: Record<VariantName, VariantMeta>;
   /** Aliases accepted for backwards compatibility */
@@ -135,6 +176,208 @@ const VARIANT_CATALOG: Record<string, ModelCatalogEntry> = {
     },
     aliases: ['gpt-5-2'],
   },
+  // GPT 5.2 Codex
+  'gpt-5.2-codex': {
+    id: 'gpt-5.2-codex',
+    defaultEnum: ModelEnum.GPT_5_2_CODEX_MEDIUM,
+    variants: {
+      low: { enumValue: ModelEnum.GPT_5_2_CODEX_LOW, description: 'Lower cost' },
+      medium: { enumValue: ModelEnum.GPT_5_2_CODEX_MEDIUM, description: 'Balanced (default)' },
+      high: { enumValue: ModelEnum.GPT_5_2_CODEX_HIGH, description: 'Higher capability' },
+      xhigh: { enumValue: ModelEnum.GPT_5_2_CODEX_XHIGH, description: 'Maximum capability' },
+      'low-priority': { enumValue: ModelEnum.GPT_5_2_CODEX_LOW_PRIORITY, description: 'Priority routing (low)' },
+      'medium-priority': { enumValue: ModelEnum.GPT_5_2_CODEX_MEDIUM_PRIORITY, description: 'Priority routing (medium)' },
+      'high-priority': { enumValue: ModelEnum.GPT_5_2_CODEX_HIGH_PRIORITY, description: 'Priority routing (high)' },
+      'xhigh-priority': { enumValue: ModelEnum.GPT_5_2_CODEX_XHIGH_PRIORITY, description: 'Priority routing (xhigh)' },
+    },
+    aliases: ['gpt-5-2-codex'],
+  },
+  // SWE-1.6 — both proto enum and string-uid metadata, but the string UID is
+  // what we actually send (uidForEntry prefers defaultUid). The enumValue is
+  // kept for callers of `modelNameToEnum()` who still want the integer; the
+  // server itself only sees `swe-1-6` / `swe-1-6-fast`.
+  'swe-1.6': {
+    id: 'swe-1.6',
+    defaultEnum: ModelEnum.SWE_1_6,
+    defaultUid: 'swe-1-6',
+    variants: {
+      fast: { enumValue: ModelEnum.SWE_1_6_FAST, modelUid: 'swe-1-6-fast', description: 'Faster variant' },
+    },
+    aliases: ['swe-1-6'],
+  },
+
+  // ============================================================================
+  // String-UID models (Cognition-era).
+  //
+  // These have NO proto enum entry — `model_or_alias.model = 0` in the server
+  // response. The identifier IS the `model_uid` string. To enumerate the live
+  // set on any given account, call GetUserStatus and walk
+  //   user_status.cascade_model_config_data.client_model_configs[]
+  // See docs/CASCADE_PROTOCOL.md §3 for the protocol details.
+  // ============================================================================
+
+  // Claude Opus 4.7 — 5 reasoning intensities × {default, -fast (priority)}
+  'claude-opus-4.7': {
+    id: 'claude-opus-4.7',
+    defaultUid: 'claude-opus-4-7-medium',
+    variants: {
+      low: { modelUid: 'claude-opus-4-7-low', description: 'Lowest reasoning budget' },
+      medium: { modelUid: 'claude-opus-4-7-medium', description: 'Balanced (default)' },
+      high: { modelUid: 'claude-opus-4-7-high', description: 'Higher reasoning' },
+      xhigh: { modelUid: 'claude-opus-4-7-xhigh', description: 'Even higher reasoning' },
+      max: { modelUid: 'claude-opus-4-7-max', description: 'Maximum reasoning' },
+      'low-fast': { modelUid: 'claude-opus-4-7-low-fast', description: 'Priority/fast tier' },
+      'medium-fast': { modelUid: 'claude-opus-4-7-medium-fast', description: 'Priority/fast tier' },
+      'high-fast': { modelUid: 'claude-opus-4-7-high-fast', description: 'Priority/fast tier' },
+      'xhigh-fast': { modelUid: 'claude-opus-4-7-xhigh-fast', description: 'Priority/fast tier' },
+      'max-fast': { modelUid: 'claude-opus-4-7-max-fast', description: 'Priority/fast tier' },
+    },
+    aliases: ['claude-opus-4-7', 'opus-4.7', 'opus-4-7'],
+  },
+
+  // Claude Opus 4.6 — base + thinking + 1M context + fast variants
+  'claude-opus-4.6': {
+    id: 'claude-opus-4.6',
+    defaultUid: 'claude-opus-4-6',
+    variants: {
+      thinking: { modelUid: 'claude-opus-4-6-thinking', description: 'Extended thinking' },
+      '1m': { modelUid: 'claude-opus-4-6-1m', description: '1M context window' },
+      'thinking-1m': { modelUid: 'claude-opus-4-6-thinking-1m', description: 'Thinking + 1M context' },
+      fast: { modelUid: 'claude-opus-4-6-fast', description: 'Priority/fast tier' },
+      'thinking-fast': { modelUid: 'claude-opus-4-6-thinking-fast', description: 'Thinking, priority tier' },
+    },
+    aliases: ['claude-opus-4-6'],
+  },
+
+  // Claude Sonnet 4.6
+  'claude-sonnet-4.6': {
+    id: 'claude-sonnet-4.6',
+    defaultUid: 'claude-sonnet-4-6',
+    variants: {
+      thinking: { modelUid: 'claude-sonnet-4-6-thinking', description: 'Extended thinking' },
+      '1m': { modelUid: 'claude-sonnet-4-6-1m', description: '1M context window' },
+      'thinking-1m': { modelUid: 'claude-sonnet-4-6-thinking-1m', description: 'Thinking + 1M context' },
+    },
+    aliases: ['claude-sonnet-4-6', 'sonnet-4.6'],
+  },
+
+  // Gemini 3.5 Flash — 4 reasoning budgets
+  'gemini-3.5-flash': {
+    id: 'gemini-3.5-flash',
+    defaultUid: 'gemini-3-5-flash-medium',
+    variants: {
+      minimal: { modelUid: 'gemini-3-5-flash-minimal', description: 'Cheapest, lowest reasoning' },
+      low: { modelUid: 'gemini-3-5-flash-low', description: 'Low reasoning' },
+      medium: { modelUid: 'gemini-3-5-flash-medium', description: 'Balanced (default)' },
+      high: { modelUid: 'gemini-3-5-flash-high', description: 'High reasoning' },
+    },
+    aliases: ['gemini-3-5-flash'],
+  },
+
+  // Gemini 3.1 Pro
+  'gemini-3.1-pro': {
+    id: 'gemini-3.1-pro',
+    defaultUid: 'gemini-3-1-pro-low',
+    variants: {
+      low: { modelUid: 'gemini-3-1-pro-low', description: 'Lower reasoning (default)' },
+      high: { modelUid: 'gemini-3-1-pro-high', description: 'Higher reasoning' },
+    },
+    aliases: ['gemini-3-1-pro'],
+  },
+
+  // GPT-5.4 — 5 reasoning intensities × {default, -priority}
+  'gpt-5.4': {
+    id: 'gpt-5.4',
+    defaultUid: 'gpt-5-4-medium',
+    variants: {
+      none: { modelUid: 'gpt-5-4-none', description: 'No reasoning' },
+      low: { modelUid: 'gpt-5-4-low', description: 'Low reasoning' },
+      medium: { modelUid: 'gpt-5-4-medium', description: 'Balanced (default)' },
+      high: { modelUid: 'gpt-5-4-high', description: 'High reasoning' },
+      xhigh: { modelUid: 'gpt-5-4-xhigh', description: 'Maximum reasoning' },
+      'none-priority': { modelUid: 'gpt-5-4-none-priority', description: 'Priority routing' },
+      'low-priority': { modelUid: 'gpt-5-4-low-priority', description: 'Priority routing' },
+      'medium-priority': { modelUid: 'gpt-5-4-medium-priority', description: 'Priority routing' },
+      'high-priority': { modelUid: 'gpt-5-4-high-priority', description: 'Priority routing' },
+      'xhigh-priority': { modelUid: 'gpt-5-4-xhigh-priority', description: 'Priority routing' },
+    },
+    aliases: ['gpt-5-4'],
+  },
+
+  // GPT-5.4 Mini
+  'gpt-5.4-mini': {
+    id: 'gpt-5.4-mini',
+    defaultUid: 'gpt-5-4-mini-medium',
+    variants: {
+      low: { modelUid: 'gpt-5-4-mini-low', description: 'Low reasoning' },
+      medium: { modelUid: 'gpt-5-4-mini-medium', description: 'Balanced (default)' },
+      high: { modelUid: 'gpt-5-4-mini-high', description: 'High reasoning' },
+      xhigh: { modelUid: 'gpt-5-4-mini-xhigh', description: 'Maximum reasoning' },
+    },
+    aliases: ['gpt-5-4-mini'],
+  },
+
+  // GPT-5.5
+  'gpt-5.5': {
+    id: 'gpt-5.5',
+    defaultUid: 'gpt-5-5-medium',
+    variants: {
+      none: { modelUid: 'gpt-5-5-none', description: 'No reasoning' },
+      low: { modelUid: 'gpt-5-5-low', description: 'Low reasoning' },
+      medium: { modelUid: 'gpt-5-5-medium', description: 'Balanced (default)' },
+      high: { modelUid: 'gpt-5-5-high', description: 'High reasoning' },
+      xhigh: { modelUid: 'gpt-5-5-xhigh', description: 'Maximum reasoning' },
+      'none-priority': { modelUid: 'gpt-5-5-none-priority', description: 'Priority routing' },
+      'low-priority': { modelUid: 'gpt-5-5-low-priority', description: 'Priority routing' },
+      'medium-priority': { modelUid: 'gpt-5-5-medium-priority', description: 'Priority routing' },
+      'high-priority': { modelUid: 'gpt-5-5-high-priority', description: 'Priority routing' },
+      'xhigh-priority': { modelUid: 'gpt-5-5-xhigh-priority', description: 'Priority routing' },
+    },
+    aliases: ['gpt-5-5'],
+  },
+
+  // GPT-5.3 Codex
+  'gpt-5.3-codex': {
+    id: 'gpt-5.3-codex',
+    defaultUid: 'gpt-5-3-codex-medium',
+    variants: {
+      low: { modelUid: 'gpt-5-3-codex-low', description: 'Low reasoning' },
+      medium: { modelUid: 'gpt-5-3-codex-medium', description: 'Balanced (default)' },
+      high: { modelUid: 'gpt-5-3-codex-high', description: 'High reasoning' },
+      xhigh: { modelUid: 'gpt-5-3-codex-xhigh', description: 'Maximum reasoning' },
+      'low-priority': { modelUid: 'gpt-5-3-codex-low-priority', description: 'Priority routing' },
+      'medium-priority': { modelUid: 'gpt-5-3-codex-medium-priority', description: 'Priority routing' },
+      'high-priority': { modelUid: 'gpt-5-3-codex-high-priority', description: 'Priority routing' },
+      'xhigh-priority': { modelUid: 'gpt-5-3-codex-xhigh-priority', description: 'Priority routing' },
+    },
+    aliases: ['gpt-5-3-codex'],
+  },
+
+  // Single-variant new models
+  'kimi-k2.5': {
+    id: 'kimi-k2.5',
+    defaultUid: 'kimi-k2-5',
+    aliases: ['kimi-k2-5'],
+  },
+  'kimi-k2.6': {
+    id: 'kimi-k2.6',
+    defaultUid: 'kimi-k2-6',
+    aliases: ['kimi-k2-6'],
+  },
+  'deepseek-v4': {
+    id: 'deepseek-v4',
+    defaultUid: 'deepseek-v4',
+  },
+  'glm-5.1': {
+    id: 'glm-5.1',
+    defaultUid: 'glm-5-1',
+    aliases: ['glm-5-1'],
+  },
+  'minimax-m2.5': {
+    id: 'minimax-m2.5',
+    defaultUid: 'minimax-m2-5',
+    aliases: ['minimax-m2-5'],
+  },
   // GPT 5
   'gpt-5': {
     id: 'gpt-5',
@@ -235,7 +478,8 @@ function normalizeModelId(modelName: string): string {
 
 function splitModelAndVariant(raw: string): { base: string; variant?: string } {
   const normalized = normalizeModelId(raw);
-  // Allow colon-delimited (opencode variants) or suffix "-<variant>"
+  // Colon-delimited form is unambiguous: `claude-opus-4.7:low-fast` always
+  // means base=claude-opus-4.7, variant=low-fast.
   const colonIdx = normalized.indexOf(':');
   if (colonIdx !== -1) {
     const base = normalized.slice(0, colonIdx);
@@ -243,11 +487,16 @@ function splitModelAndVariant(raw: string): { base: string; variant?: string } {
     return { base, variant: variant || undefined };
   }
 
+  // Hyphen-suffix form: `claude-opus-4.7-low-fast`. Try progressively shorter
+  // suffix variants so multi-segment variant names (e.g. `low-fast`,
+  // `thinking-1m`, `medium-priority`) work too. Single-segment peeling alone
+  // misses every compound variant we ship.
   const parts = normalized.split('-');
-  if (parts.length > 1) {
-    const maybeVariant = parts[parts.length - 1];
-    const base = parts.slice(0, -1).join('-');
-    if (VARIANT_CATALOG[ALIAS_TO_ID[base] || base]?.variants?.[maybeVariant]) {
+  for (let cut = 1; cut < parts.length; cut++) {
+    const base = parts.slice(0, parts.length - cut).join('-');
+    const maybeVariant = parts.slice(parts.length - cut).join('-');
+    const entry = VARIANT_CATALOG[ALIAS_TO_ID[base] || base];
+    if (entry?.variants?.[maybeVariant]) {
       return { base, variant: maybeVariant };
     }
   }
@@ -257,6 +506,16 @@ function splitModelAndVariant(raw: string): { base: string; variant?: string } {
 
 // ============================================================================
 // Model Name Mappings (legacy fallback)
+//
+// SOURCE-OF-TRUTH POLICY:
+//   - For models with multiple variants or string UIDs → add to VARIANT_CATALOG
+//   - For legacy proto-enum models with no variants → add to this map
+//   - resolveModel checks VARIANT_CATALOG first, then this fallback
+//
+// A module-load sanity check below (`enforceModelTableInvariants`) verifies
+// every VARIANT_CATALOG.id resolves through this table too (for callers that
+// hit the legacy alias path) — drift gets caught at import time rather than
+// silently routing to a wrong model.
 // ============================================================================
 
 /**
@@ -493,6 +752,26 @@ const MODEL_NAME_TO_ENUM: Record<string, ModelEnumValue> = {
   'swe-1-5-thinking': ModelEnum.SWE_1_5_THINKING,
   'swe-1.5-slow': ModelEnum.SWE_1_5_SLOW,
   'swe-1-5-slow': ModelEnum.SWE_1_5_SLOW,
+  'swe-1.6': ModelEnum.SWE_1_6,
+  'swe-1-6': ModelEnum.SWE_1_6,
+  'swe-1.6-fast': ModelEnum.SWE_1_6_FAST,
+  'swe-1-6-fast': ModelEnum.SWE_1_6_FAST,
+
+  // GPT-OSS
+  'gpt-oss-120b': ModelEnum.GPT_OSS_120B,
+  'gpt-oss': ModelEnum.GPT_OSS_120B,
+
+  // GPT 5.2 Codex
+  'gpt-5.2-codex': ModelEnum.GPT_5_2_CODEX_MEDIUM,
+  'gpt-5-2-codex': ModelEnum.GPT_5_2_CODEX_MEDIUM,
+  'gpt-5.2-codex-low': ModelEnum.GPT_5_2_CODEX_LOW,
+  'gpt-5.2-codex-medium': ModelEnum.GPT_5_2_CODEX_MEDIUM,
+  'gpt-5.2-codex-high': ModelEnum.GPT_5_2_CODEX_HIGH,
+  'gpt-5.2-codex-xhigh': ModelEnum.GPT_5_2_CODEX_XHIGH,
+  'gpt-5.2-codex-low-priority': ModelEnum.GPT_5_2_CODEX_LOW_PRIORITY,
+  'gpt-5.2-codex-medium-priority': ModelEnum.GPT_5_2_CODEX_MEDIUM_PRIORITY,
+  'gpt-5.2-codex-high-priority': ModelEnum.GPT_5_2_CODEX_HIGH_PRIORITY,
+  'gpt-5.2-codex-xhigh-priority': ModelEnum.GPT_5_2_CODEX_XHIGH_PRIORITY,
 };
 
 /**
@@ -611,17 +890,31 @@ const ENUM_TO_MODEL_NAME: Partial<Record<ModelEnumValue, string>> = {
   [ModelEnum.SWE_1_5]: 'swe-1.5',
   [ModelEnum.SWE_1_5_THINKING]: 'swe-1.5-thinking',
   [ModelEnum.SWE_1_5_SLOW]: 'swe-1.5-slow',
+  [ModelEnum.SWE_1_6]: 'swe-1.6',
+  [ModelEnum.SWE_1_6_FAST]: 'swe-1.6-fast',
+  [ModelEnum.GPT_OSS_120B]: 'gpt-oss-120b',
+  [ModelEnum.GPT_5_2_CODEX_LOW]: 'gpt-5.2-codex-low',
+  [ModelEnum.GPT_5_2_CODEX_MEDIUM]: 'gpt-5.2-codex',
+  [ModelEnum.GPT_5_2_CODEX_HIGH]: 'gpt-5.2-codex-high',
+  [ModelEnum.GPT_5_2_CODEX_XHIGH]: 'gpt-5.2-codex-xhigh',
 };
 
 // ============================================================================
 // Public API
 // ============================================================================
 
-export function resolveModel(modelName: string, variantOverride?: string): {
-  enumValue: ModelEnumValue;
+export interface ResolvedModel {
+  /** Canonical model id (e.g. "claude-opus-4.7" — what OpenCode displays) */
   modelId: string;
+  /** Server `model_uid` string sent in `requested_model_uid`. */
+  modelUid: string;
+  /** Selected variant if any (e.g. "high", "thinking", "1m"). */
   variant?: string;
-} {
+  /** Legacy proto-enum value. Undefined for Cognition-era string-UID models. */
+  enumValue?: ModelEnumValue;
+}
+
+export function resolveModel(modelName: string, variantOverride?: string): ResolvedModel {
   const { base, variant } = splitModelAndVariant(modelName);
   const baseId = ALIAS_TO_ID[base] || base;
 
@@ -629,40 +922,83 @@ export function resolveModel(modelName: string, variantOverride?: string): {
   if (entry) {
     const effectiveVariant = (variantOverride || variant || '').trim().toLowerCase();
     if (effectiveVariant && entry.variants?.[effectiveVariant]) {
+      const v = entry.variants[effectiveVariant]!;
       return {
-        enumValue: entry.variants[effectiveVariant]!.enumValue,
         modelId: entry.id,
+        modelUid: uidForVariant(v) ?? uidForEntry(entry),
+        enumValue: v.enumValue,
         variant: effectiveVariant,
       };
     }
-    return { enumValue: entry.defaultEnum, modelId: entry.id };
+    return { modelId: entry.id, modelUid: uidForEntry(entry), enumValue: entry.defaultEnum };
   }
 
-  // Fallback to legacy map
+  // Fallback to legacy alias table (proto-enum-only models).
   const normalized = normalizeModelId(modelName);
   const enumValue = MODEL_NAME_TO_ENUM[normalized];
   if (enumValue) {
-    return { enumValue, modelId: normalized };
+    return { modelId: normalized, modelUid: enumNameForValueOrFail(enumValue), enumValue };
   }
 
-  return { enumValue: ModelEnum.CLAUDE_3_5_SONNET_20241022, modelId: 'claude-3.5-sonnet' };
+  // Unknown model — surface a typed error rather than silently routing to a
+  // random model. A typo in the OpenCode config used to land on
+  // claude-3.5-sonnet, which billed the user and produced confusing results.
+  throw new Error(
+    `Unknown Windsurf model: "${modelName}". ` +
+      `See README "Supported Models (canonical names)" or call /v1/models for the full list.`
+  );
 }
 
 /**
- * Convert a model name string (optionally including variant) to enum
+ * Variant → uid resolution:
+ *   1. explicit `modelUid` (Cognition-era string UID)
+ *   2. derive from `enumValue` as "MODEL_<KEY>"
+ *   3. nothing → caller falls back to entry-level
+ */
+function uidForVariant(v: VariantMeta): string | undefined {
+  if (v.modelUid) return v.modelUid;
+  if (v.enumValue !== undefined) return ENUM_VALUE_TO_NAME.get(v.enumValue as number);
+  return undefined;
+}
+
+function uidForEntry(entry: ModelCatalogEntry): string {
+  if (entry.defaultUid) return entry.defaultUid;
+  if (entry.defaultEnum !== undefined) {
+    const uid = ENUM_VALUE_TO_NAME.get(entry.defaultEnum as number);
+    if (uid) return uid;
+  }
+  throw new Error(`Catalog entry "${entry.id}" has neither defaultUid nor defaultEnum`);
+}
+
+function enumNameForValueOrFail(v: ModelEnumValue): string {
+  const uid = ENUM_VALUE_TO_NAME.get(v as number);
+  if (!uid) throw new Error(`No enum-name found for value ${v}`);
+  return uid;
+}
+
+/**
+ * Convert a model name string (optionally including variant) to its proto
+ * enum value.
+ *
+ * New string-UID models (claude-opus-4.7, gemini-3.5-flash, …) don't have a
+ * proto enum — calling this for them is a programming error. Use
+ * `resolveModel(name).modelUid` instead, which works uniformly.
  */
 export function modelNameToEnum(modelName: string, variantOverride?: string): ModelEnumValue {
-  return resolveModel(modelName, variantOverride).enumValue;
+  const resolved = resolveModel(modelName, variantOverride);
+  if (resolved.enumValue === undefined) {
+    throw new Error(
+      `Model "${modelName}" has no proto enum value (string-UID model "${resolved.modelUid}"). ` +
+        `Use resolveModel(name).modelUid instead of modelNameToEnum().`
+    );
+  }
+  return resolved.enumValue;
 }
 
-/**
- * Convert a protobuf enum value to a canonical model name
- * @param enumValue - The enum value
- * @returns The canonical model name string
- */
-export function enumToModelName(enumValue: ModelEnumValue): string {
-  return ENUM_TO_MODEL_NAME[enumValue] ?? 'claude-3.5-sonnet';
-}
+// `enumToModelName` removed: was unused after the Cascade flow switch, and
+// the previous silent-fallback-to-claude-3.5-sonnet was a footgun. If a
+// future caller needs the reverse lookup, read from ENUM_TO_MODEL_NAME
+// directly so the `undefined` case is impossible to ignore.
 
 /**
  * Get all supported model names (includes legacy aliases)
@@ -725,3 +1061,16 @@ export function getModelVariants(modelId: string): Record<string, VariantMeta> |
   const baseId = ALIAS_TO_ID[normalizeModelId(modelId)] || normalizeModelId(modelId);
   return VARIANT_CATALOG[baseId]?.variants;
 }
+
+// Note on the dual model tables (VARIANT_CATALOG + MODEL_NAME_TO_ENUM):
+//   - VARIANT_CATALOG is the primary source of truth. resolveModel checks it
+//     first and only falls through to MODEL_NAME_TO_ENUM for entries that
+//     don't appear in the catalog.
+//   - When adding a new proto-enum model, prefer adding it to VARIANT_CATALOG
+//     (even with no variants) rather than only to the legacy table.
+//   - The two are not auto-synchronised; a sanity check used to live here but
+//     was removed because its only signalling channel was console output,
+//     which surfaces in the user's opencode terminal when the plugin loads.
+//   - To audit drift manually: every VARIANT_CATALOG entry with a
+//     `defaultEnum` should ALSO appear in MODEL_NAME_TO_ENUM keyed by its
+//     canonical id, mapping to the same enum value.

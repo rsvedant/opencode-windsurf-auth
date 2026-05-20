@@ -610,6 +610,117 @@
             "context": 200000,
             "output": 8192
           }
+        },
+        "swe-1.6": {
+          "name": "SWE 1.6 (Windsurf)",
+          "limit": {
+            "context": 200000,
+            "output": 8192
+          },
+          "variants": {
+            "fast": {}
+          }
+        },
+        "gpt-oss-120b": {
+          "name": "GPT-OSS 120B (Windsurf)",
+          "limit": {
+            "context": 200000,
+            "output": 8192
+          }
+        },
+        "gpt-5.2-codex": {
+          "name": "GPT 5.2 Codex (Windsurf)",
+          "limit": { "context": 200000, "output": 8192 },
+          "variants": {
+            "low": {},
+            "medium": {},
+            "high": {},
+            "xhigh": {},
+            "low-priority": {},
+            "medium-priority": {},
+            "high-priority": {},
+            "xhigh-priority": {}
+          }
+        },
+
+        "claude-opus-4.7": {
+          "name": "Claude Opus 4.7 (Windsurf)",
+          "limit": { "context": 200000, "output": 8192 },
+          "variants": {
+            "low": {}, "medium": {}, "high": {}, "xhigh": {}, "max": {},
+            "low-fast": {}, "medium-fast": {}, "high-fast": {}, "xhigh-fast": {}, "max-fast": {}
+          }
+        },
+        "claude-opus-4.6": {
+          "name": "Claude Opus 4.6 (Windsurf)",
+          "limit": { "context": 200000, "output": 8192 },
+          "variants": {
+            "thinking": {}, "1m": {}, "thinking-1m": {}, "fast": {}, "thinking-fast": {}
+          }
+        },
+        "claude-sonnet-4.6": {
+          "name": "Claude Sonnet 4.6 (Windsurf)",
+          "limit": { "context": 200000, "output": 8192 },
+          "variants": { "thinking": {}, "1m": {}, "thinking-1m": {} }
+        },
+        "gemini-3.5-flash": {
+          "name": "Gemini 3.5 Flash (Windsurf)",
+          "limit": { "context": 1000000, "output": 8192 },
+          "variants": { "minimal": {}, "low": {}, "medium": {}, "high": {} }
+        },
+        "gemini-3.1-pro": {
+          "name": "Gemini 3.1 Pro (Windsurf)",
+          "limit": { "context": 1000000, "output": 8192 },
+          "variants": { "low": {}, "high": {} }
+        },
+        "gpt-5.4": {
+          "name": "GPT 5.4 (Windsurf)",
+          "limit": { "context": 200000, "output": 8192 },
+          "variants": {
+            "none": {}, "low": {}, "medium": {}, "high": {}, "xhigh": {},
+            "none-priority": {}, "low-priority": {}, "medium-priority": {}, "high-priority": {}, "xhigh-priority": {}
+          }
+        },
+        "gpt-5.4-mini": {
+          "name": "GPT 5.4 Mini (Windsurf)",
+          "limit": { "context": 200000, "output": 8192 },
+          "variants": { "low": {}, "medium": {}, "high": {}, "xhigh": {} }
+        },
+        "gpt-5.5": {
+          "name": "GPT 5.5 (Windsurf)",
+          "limit": { "context": 200000, "output": 8192 },
+          "variants": {
+            "none": {}, "low": {}, "medium": {}, "high": {}, "xhigh": {},
+            "none-priority": {}, "low-priority": {}, "medium-priority": {}, "high-priority": {}, "xhigh-priority": {}
+          }
+        },
+        "gpt-5.3-codex": {
+          "name": "GPT 5.3 Codex (Windsurf)",
+          "limit": { "context": 200000, "output": 8192 },
+          "variants": {
+            "low": {}, "medium": {}, "high": {}, "xhigh": {},
+            "low-priority": {}, "medium-priority": {}, "high-priority": {}, "xhigh-priority": {}
+          }
+        },
+        "kimi-k2.5": {
+          "name": "Kimi K2.5 (Windsurf)",
+          "limit": { "context": 200000, "output": 8192 }
+        },
+        "kimi-k2.6": {
+          "name": "Kimi K2.6 (Windsurf)",
+          "limit": { "context": 200000, "output": 8192 }
+        },
+        "deepseek-v4": {
+          "name": "DeepSeek V4 (Windsurf)",
+          "limit": { "context": 200000, "output": 8192 }
+        },
+        "glm-5.1": {
+          "name": "GLM 5.1 (Windsurf)",
+          "limit": { "context": 200000, "output": 8192 }
+        },
+        "minimax-m2.5": {
+          "name": "Minimax M2.5 (Windsurf)",
+          "limit": { "context": 200000, "output": 8192 }
         }
       }
     }
