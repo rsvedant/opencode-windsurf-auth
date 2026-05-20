@@ -10,11 +10,18 @@ name: Publish to npm
 # Manual override: `workflow_dispatch` (with optional `dry_run`) lets you
 # rehearse the pipeline without publishing.
 #
-# Auth: npm Trusted Publisher (OIDC). Configure once at
-#   https://www.npmjs.com/package/opencode-windsurf-auth/access
-# Publisher = GitHub Actions, org = rsvedant, repo = opencode-windsurf-auth,
-# workflow filename = publish.yml. No NPM_TOKEN secret needed —
-# `permissions.id-token: write` + actions/setup-node give npm the OIDC token.
+# Auth (hybrid):
+#   - `npm publish` uses npm Trusted Publisher (OIDC) — no long-lived secret.
+#     Configure once at:
+#       https://www.npmjs.com/package/opencode-windsurf-auth/access
+#     Publisher = GitHub Actions, org = rsvedant,
+#     repo = opencode-windsurf-auth, workflow filename = publish.yml.
+#   - `npm dist-tag add` falls back to NPM_TOKEN because npm's OIDC flow
+#     is scoped to `publish` only and doesn't cover dist-tag operations.
+#     Create a Granular Access Token at
+#       https://www.npmjs.com/settings/<user>/tokens/granular-access-tokens/new
+#     scoped to package `opencode-windsurf-auth` with read+write access,
+#     then save it as the `NPM_TOKEN` repo secret.
 
 on:
   push:
@@ -99,6 +106,11 @@ jobs:
       - name: Point beta dist-tag at the new version
         if: ${{ inputs.dry_run != true }}
         run: npm dist-tag add "opencode-windsurf-auth@${{ steps.version.outputs.version }}" beta
+        env:
+          # OIDC token from `npm publish` isn't reused for dist-tag — npm's
+          # Trusted Publisher flow only authenticates the publish operation.
+          # Falls back to the granular NPM_TOKEN scoped just to this package.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Summary
         run: |
