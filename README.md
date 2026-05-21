@@ -10,6 +10,7 @@ Opencode plugin for Windsurf/Codeium authentication - use Windsurf models in Ope
 ## Features
 
 - OpenAI-compatible `/v1/chat/completions` interface with streaming SSE
+- Automatic model discovery - Models are auto-pulled from Windsurf
 - Automatic credential discovery (CSRF token, port, API key)
 - Transparent REST↔gRPC translation over HTTP/2
 - Zero extra auth prompts when Windsurf is running
@@ -34,7 +35,7 @@ bun add opencode-windsurf-auth@beta
 
 ## Opencode Configuration
 
-Add the following to your Opencode config (typically `~/.config/opencode/config.json`). The plugin starts a local proxy server on port 42100 (falls back to a random free port and updates `chat.params` automatically). The full model list with variants is in `opencode_config_example.json`; thinking vs non-thinking are separate models, while variants are only for performance tiers (low/high/xhigh/etc.).
+Add the following to your Opencode config (typically `~/.config/opencode/config.json`). The plugin starts a local proxy server on port 42100 (falls back to a random free port and updates `chat.params` automatically).
 
 ```json
 {
@@ -45,44 +46,6 @@ Add the following to your Opencode config (typically `~/.config/opencode/config.
       "npm": "@ai-sdk/openai-compatible",
       "options": {
         "baseURL": "http://127.0.0.1:42100/v1"
-      },
-      "models": {
-        "claude-opus-4.7": {
-          "name": "Claude Opus 4.7 (Windsurf)",
-          "limit": { "context": 1000000, "output": 128000 },
-          "variants": {
-            "low": {}, "medium": {}, "high": {}, "xhigh": {}, "max": {},
-            "low-fast": {}, "medium-fast": {}, "high-fast": {}, "xhigh-fast": {}, "max-fast": {}
-          }
-        },
-        "gpt-5.5": {
-          "name": "GPT 5.5 (Windsurf)",
-          "limit": { "context": 1050000, "output": 128000 },
-          "variants": {
-            "none": {}, "low": {}, "medium": {}, "high": {}, "xhigh": {},
-            "none-priority": {}, "low-priority": {}, "medium-priority": {}, "high-priority": {}, "xhigh-priority": {}
-          }
-        },
-        "deepseek-v4": {
-          "name": "DeepSeek V4 (Windsurf)",
-          "limit": { "context": 1000000, "output": 384000 }
-        },
-        "kimi-k2.6": {
-          "name": "Kimi K2.6 (Windsurf)",
-          "limit": { "context": 262144, "output": 262144 }
-        },
-        "gemini-3.5-flash": {
-          "name": "Gemini 3.5 Flash (Windsurf)",
-          "limit": { "context": 1048576, "output": 65536 },
-          "variants": { "minimal": {}, "low": {}, "medium": {}, "high": {} }
-        },
-        "claude-opus-4.6": {
-          "name": "Claude Opus 4.6 (Windsurf)",
-          "limit": { "context": 1000000, "output": 128000 },
-          "variants": {
-            "thinking": {}, "1m": {}, "thinking-1m": {}, "fast": {}, "thinking-fast": {}
-          }
-        }
       }
     }
   }

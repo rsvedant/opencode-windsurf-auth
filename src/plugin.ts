@@ -24,6 +24,7 @@ import {
   getModelVariants,
   resolveModel,
 } from './plugin/models.js';
+import { discoverModels, type OpenCodeModel } from './plugin/model-discovery.js';
 import { PLUGIN_ID } from './constants.js';
 
 // ============================================================================
@@ -653,25 +654,41 @@ async function ensureWindsurfProxyServer(): Promise<string> {
 
       // Models endpoint
       if (url.pathname === '/v1/models' || url.pathname === '/models') {
-        const models = getCanonicalModels();
+        // Use dynamic model discovery from Windsurf instead of static catalog
+        const discoveredModels = await discoverModels();
+        
+        let models: OpenCodeModel[];
+        
+        if (discoveredModels.length > 0) {
+          // Use dynamically discovered models
+          models = discoveredModels;
+        } else {
+          // Fall back to static catalog if discovery fails
+          models = getCanonicalModels().map((id) => {
+            const variants = getModelVariants(id);
+            return {
+              id,
+              name: `${id} (Windsurf)`,
+              limit: { context: 200000, output: 8192 },
+              ...(variants ? { variants } : {}),
+            };
+          });
+        }
+        
         return new Response(
           JSON.stringify({
             object: 'list',
-            data: models.map((id) => {
-              const variants = getModelVariants(id);
+            data: models.map((model) => {
+              const variantList = model.variants 
+                ? Object.keys(model.variants).map((v) => ({ id: v }))
+                : undefined;
+              
               return {
-                id,
+                id: model.id,
                 object: 'model',
                 created: Math.floor(Date.now() / 1000),
                 owned_by: 'windsurf',
-                ...(variants
-                  ? {
-                      variants: Object.entries(variants).map(([name, meta]) => ({
-                        id: name,
-                        description: meta.description,
-                      })),
-                    }
-                  : {}),
+                ...(variantList && variantList.length > 0 ? { variants: variantList } : {}),
               };
             }),
           }),

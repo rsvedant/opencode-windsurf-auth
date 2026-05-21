@@ -1,4 +1,5 @@
 {
+  "_comment": "DEPRECATED: Manual model configuration is no longer needed. Models are auto-discovered from Windsurf via GetUserStatus. Remove the 'models' section and let the plugin discover models dynamically.",
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
     "opencode-windsurf-auth"

@@ -80,7 +80,7 @@ type ModelCatalogEntry = {
 // Variant Catalog
 // ==========================================================================
 
-const VARIANT_CATALOG: Record<string, ModelCatalogEntry> = {
+export const VARIANT_CATALOG: Record<string, ModelCatalogEntry> = {
   // Claude thinking variants
   'claude-3.7-sonnet': {
     id: 'claude-3.7-sonnet',

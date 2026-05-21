@@ -29,6 +29,8 @@ import {
   encodeVarintField,
 } from './protobuf.js';
 
+export { encodeMessage };
+
 function encodeTimestampBody(): number[] {
   const now = Date.now();
   const seconds = Math.floor(now / 1000);
@@ -62,7 +64,7 @@ let nextRequestId = BigInt(Date.now());
  *   17 extension_path (empty), 24 device_fingerprint (empty), 25 trigger_id,
  *   26 plan_name, 28 ide_type.
  */
-function buildMetadata(creds: WindsurfCredentials, sessionId: string): number[] {
+export function buildMetadata(creds: WindsurfCredentials, sessionId: string): number[] {
   const fields = getMetadataFields();
   const requestId = nextRequestId++;
   const triggerId = crypto.randomUUID();
@@ -89,7 +91,7 @@ function buildMetadata(creds: WindsurfCredentials, sessionId: string): number[] 
 // gRPC unary helper
 // ============================================================================
 
-function unaryRpc(
+export function unaryRpc(
   creds: WindsurfCredentials,
   rpcName: string,
   payload: Buffer,
@@ -198,7 +200,7 @@ function wrapError(rpcName: string, err: Error): WindsurfError {
 
 import { decodeVarint as decodeVarintAt } from './protobuf.js';
 
-function walkFields(
+export function walkFields(
   buf: Buffer,
   visit: (field: number, wire: number, value: Buffer | bigint) => void
 ): void {
@@ -559,6 +561,121 @@ const STEADY_TICKS_BEFORE_DONE = 4;
 const MAX_CONSECUTIVE_POLL_ERRORS = 3;
 const MAX_POLL_ERRORS_PER_WINDOW = 5;
 const POLL_ERROR_WINDOW_SIZE = 15;
+
+// ============================================================================
+// Model Discovery via GetUserStatus
+// ============================================================================
+
+export interface ModelConfig {
+  label: string;
+  modelUid: string;
+  modelEnum?: number;
+  isNew: boolean;
+  contextLimit?: number;
+  outputLimit?: number;
+}
+
+/**
+ * Parse output limit from Field 32 text description.
+ * 
+ * Field 32 contains text like "OutputA 1M tokens" or "OutputC 200K tokens".
+ * This function extracts the number and converts it to tokens.
+ */
+function parseOutputLimit(text: string): number | undefined {
+  // Look for "Output" followed by a number with unit (K, M, B)
+  const match = text.match(/Output\s*[^\d]*?(\d+(?:\.\d+)?)(K|M|B|T)?/i);
+  if (!match) return undefined;
+  
+  const value = parseFloat(match[1]);
+  const unit = (match[2] || '').toUpperCase();
+  
+  const multipliers: Record<string, number> = {
+    '': 1,
+    'K': 1000,
+    'M': 1000000,
+    'B': 1000000000,
+    'T': 1000000000000,
+  };
+  
+  const multiplier = multipliers[unit] || 1;
+  return Math.floor(value * multiplier);
+}
+
+/**
+ * Fetch the live model list from Windsurf via GetUserStatus.
+ * 
+ * Returns the client_model_configs[] array which contains:
+ * - field 1: label (display name)
+ * - field 2: model_or_alias (submessage with optional model enum)
+ * - field 15: is_new (bool)
+ * - field 22: model_uid (string) - the actual identifier
+ */
+export async function getUserStatus(
+  creds: WindsurfCredentials,
+  signal?: AbortSignal
+): Promise<ModelConfig[]> {
+  const meta = buildMetadata(creds, crypto.randomUUID());
+  const payload = Buffer.from(encodeMessage(1, meta));
+
+  const body = await unaryRpc(creds, 'GetUserStatus', payload, 10_000, signal);
+
+  const configs: ModelConfig[] = [];
+  
+  // Walk the response to find user data (field 1) → model configs (field 33)
+  walkFields(body, (field, wire, value) => {
+    if (field === 1 && wire === 2 && Buffer.isBuffer(value)) {
+      // Inside user data, find model configs (field 33)
+      walkFields(value, (nestedField, nestedWire, nestedValue) => {
+        if (nestedField === 33 && nestedWire === 2 && Buffer.isBuffer(nestedValue)) {
+          // Inside model configs, find client_model_configs (field 1, repeated)
+          walkFields(nestedValue, (configField, configWire, configValue) => {
+            if (configField === 1 && configWire === 2 && Buffer.isBuffer(configValue)) {
+              // Parse individual client_model_config entry
+              const config: ModelConfig = {
+                label: '',
+                modelUid: '',
+                isNew: false,
+              };
+
+              walkFields(configValue, (entryField, entryWire, entryValue) => {
+                if (entryField === 1 && entryWire === 2 && Buffer.isBuffer(entryValue)) {
+                  config.label = entryValue.toString('utf8');
+                } else if (entryField === 2 && entryWire === 2 && Buffer.isBuffer(entryValue)) {
+                  // model_or_alias submessage - extract model enum (field 1)
+                  walkFields(entryValue, (aliasField, aliasWire, aliasValue) => {
+                    if (aliasField === 1 && aliasWire === 0) {
+                      config.modelEnum = Number(aliasValue as bigint);
+                    }
+                  });
+                } else if (entryField === 15 && entryWire === 0) {
+                  config.isNew = (entryValue as bigint) === 1n;
+                } else if (entryField === 18 && entryWire === 0) {
+                  // context limit (field 18)
+                  config.contextLimit = Number(entryValue as bigint);
+                } else if (entryField === 22 && entryWire === 2 && Buffer.isBuffer(entryValue)) {
+                  config.modelUid = entryValue.toString('utf8');
+                } else if (entryField === 32 && entryWire === 2 && Buffer.isBuffer(entryValue)) {
+                  // Field 32 contains text descriptions with output limits
+                  const text = entryValue.toString('utf8');
+                  const outputLimit = parseOutputLimit(text);
+                  if (outputLimit && (!config.outputLimit || outputLimit > config.outputLimit)) {
+                    config.outputLimit = outputLimit;
+                  }
+                }
+              });
+
+              if (config.modelUid) {
+                configs.push(config);
+              }
+            }
+          });
+        }
+      });
+    }
+  });
+
+  return configs;
+}
 
 export async function* streamCascadeChat(
   creds: WindsurfCredentials,
