@@ -849,8 +849,13 @@ export async function* streamChatEvents(req: CloudChatRequest): AsyncGenerator<C
     }
   }
 
+  // Track the idle timer at outer scope so the finally block can clear it
+  // regardless of how we exit the read loop (clean done, throw, etc).
+  // Previously this lived inside `try { ... }` and was only cleared on
+  // normal exit — an error path left a 120s timer in the event loop and
+  // the process refused to exit promptly.
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
   try {
-    let idleTimer: ReturnType<typeof setTimeout> | null = null;
     const resetIdle = (): Promise<{ value?: Uint8Array; done: boolean }> => {
       if (idleTimer) clearTimeout(idleTimer);
       const idleController = new AbortController();
@@ -917,8 +922,12 @@ export async function* streamChatEvents(req: CloudChatRequest): AsyncGenerator<C
         yield* decodeChatFrame(payload);
       }
     }
-    if (idleTimer) clearTimeout(idleTimer);
   } finally {
+    // Always clear the idle timer. The previous "clear on normal exit
+    // only" path leaked a 120s setTimeout into the event loop on any
+    // throw (idle timeout, gunzip error, trailer error, etc), keeping
+    // the process from exiting promptly.
+    if (idleTimer) clearTimeout(idleTimer);
     try { reader.releaseLock(); } catch { /* */ }
   }
 

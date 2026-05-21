@@ -619,15 +619,27 @@ const slotRegistry = globalThis as unknown as Record<string, ProxyRegistrySlot |
 
 const PLUGIN_VERSION: string = (() => {
   // Read once at module load — used to namespace the global slot key so
-  // multiple plugin versions in the same process don't fight.
-  try {
-    // Synthesized version string; the build pipeline doesn't ship our
-    // package.json next to dist/, so we fall back to the wire-format tag.
-    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as { version?: string };
-    return typeof pkg.version === 'string' ? pkg.version : 'cloud-direct.1';
-  } catch {
-    return 'cloud-direct.1';
+  // multiple plugin versions in the same process don't fight (e.g. two
+  // entries in a monorepo's lockfile resolving to different
+  // opencode-windsurf-auth versions). Probe several paths because
+  // __dirname differs between dev (src/) and dist/ (dist/src/),
+  // and installed packages place package.json at varying relative depths.
+  const candidates = [
+    path.join(__dirname, '..', '..', 'package.json'),       // src/plugin.ts → repo root
+    path.join(__dirname, '..', '..', '..', 'package.json'), // dist/src/plugin.js → package root
+    path.join(__dirname, '..', 'package.json'),             // edge: tsc output alongside
+  ];
+  for (const p of candidates) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(p, 'utf8')) as { name?: string; version?: string };
+      // Sanity-check the name so we don't pick up an unrelated package.json
+      // up the tree (e.g. a monorepo's root).
+      if (pkg.name === 'opencode-windsurf-auth' && typeof pkg.version === 'string') {
+        return pkg.version;
+      }
+    } catch { /* try next */ }
   }
+  return 'cloud-direct.1';
 })();
 
 function getGlobalKey(): string {
@@ -808,9 +820,17 @@ async function ensureWindsurfProxyServer(): Promise<string> {
           // (system prompts top out around 200KB). Reject anything 32MB+
           // before we even try to parse it. Defense against accidental or
           // hostile request-body floods.
-          const declaredLen = Number(req.headers.get('content-length') ?? '0');
-          if (declaredLen > 32 * 1024 * 1024) {
+          // Content-Length pre-check. Number.isFinite filters out NaN
+          // (which `Number('abc')` and missing/malformed headers produce)
+          // — otherwise an attacker setting `Content-Length: oops` would
+          // bypass the cap because `NaN > MAX === false`.
+          const rawLen = req.headers.get('content-length');
+          const declaredLen = rawLen !== null ? Number(rawLen) : 0;
+          if (Number.isFinite(declaredLen) && declaredLen > 32 * 1024 * 1024) {
             return openAIError(413, `Request body too large: ${declaredLen} bytes (max 32 MB).`);
+          }
+          if (rawLen !== null && !Number.isFinite(declaredLen)) {
+            return openAIError(400, `Malformed Content-Length: ${rawLen}.`);
           }
           // resolveCredentials prefers OAuth (no Windsurf required) and falls
           // back to scraping the running Windsurf process. It throws a
@@ -849,8 +869,12 @@ async function ensureWindsurfProxyServer(): Promise<string> {
               // parameters look suspicious ($ref / discriminator / oneOf)
               try {
                 const dumpPath = path.join(os.tmpdir(), 'opencode-windsurf-auth-debug', 'tools-dump.json');
-                fs.mkdirSync(path.dirname(dumpPath), { recursive: true });
-                fs.writeFileSync(dumpPath, JSON.stringify(requestBody.tools, null, 2));
+                // Tighten parent dir + file mode to 0700 / 0600 so the
+                // dumped tool schemas (which can include user file paths
+                // in descriptions) aren't world-readable on shared hosts.
+                fs.mkdirSync(path.dirname(dumpPath), { recursive: true, mode: 0o700 });
+                fs.writeFileSync(dumpPath, JSON.stringify(requestBody.tools, null, 2), { mode: 0o600 });
+                try { fs.chmodSync(dumpPath, 0o600); } catch { /* ok */ }
                 debugLog.log(`  full tools dumped to ${dumpPath}`);
               } catch (e) {
                 debugLog.log(`  tools dump failed: ${(e as Error).message}`);
@@ -1122,14 +1146,29 @@ export const createWindsurfPlugin =
          */
         async loader(getAuth: () => Promise<Auth>) {
           try {
-            const auth = await getAuth();
-            // Auth is OAuth | ApiAuth | WellKnownAuth — discriminate on .type
-            // to pull the right field. Both ApiAuth and WellKnownAuth expose
-            // `.key`; OAuth exposes `.access` (short-lived bearer).
-            let opencodeKey: string | undefined;
-            if (auth && typeof auth === 'object') {
-              if (auth.type === 'oauth') opencodeKey = auth.access;
-              else opencodeKey = auth.key;
+            // Defensive: opencode can transiently return `undefined` from
+            // getAuth() during its own auth-store refresh window. If we
+            // believed that and immediately deleted credentials.json
+            // (because the saved file has syncedViaOpencodeAuth=true), the
+            // user would be silently logged out mid-session and the next
+            // chat would 401 / quotaless-prompt.
+            //
+            // Mitigation: when getAuth() returns no key, try again after a
+            // short delay before concluding the user actually logged out.
+            // A real logout is monotonic (auth stays empty); a transient
+            // returns a key on the retry.
+            const readKey = async (): Promise<string | undefined> => {
+              const auth = await getAuth();
+              if (!auth || typeof auth !== 'object') return undefined;
+              if (auth.type === 'oauth') return auth.access;
+              return auth.key;
+            };
+            let opencodeKey = await readKey();
+            if (!opencodeKey) {
+              // Second look after 50ms — same order of magnitude as
+              // opencode's internal refresh window.
+              await new Promise((r) => setTimeout(r, 50));
+              opencodeKey = await readKey();
             }
             const existing = (() => { try { return loadOAuthCredentials(); } catch { return null; } })();
 
@@ -1149,10 +1188,20 @@ export const createWindsurfPlugin =
                 });
               }
             } else if (existing?.syncedViaOpencodeAuth) {
-              // opencode-managed key was cleared (logout). Mirror that to
-              // credentials.json so the chat path stops accepting it.
+              // opencode-managed key was confirmed-cleared on BOTH reads
+              // (initial + 50ms retry). Mirror to credentials.json so the
+              // chat path stops accepting the stale token.
               const { deleteCredentials } = await import('./oauth/storage.js');
               deleteCredentials();
+              // Also drop the in-memory JWT cache so a long-running
+              // opencode process doesn't keep using the just-invalidated
+              // api_key for the next 24min.
+              try {
+                const { clearCachedUserJwt } = await import('./cloud-direct/auth.js');
+                clearCachedUserJwt();
+                const { clearSessionIds } = await import('./cloud-direct/chat.js');
+                clearSessionIds();
+              } catch { /* best-effort */ }
             }
             // (otherwise leave credentials.json alone — likely written by our
             // standalone CLI without opencode involvement.)

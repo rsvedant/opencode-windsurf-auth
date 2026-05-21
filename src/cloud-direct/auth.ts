@@ -112,7 +112,10 @@ export async function mintUserJwt(
       const s = (f.value as Buffer).toString('utf8');
       // Sanity-check the shape — defensive: if the cloud ever moves user_jwt
       // out from field 1 we want a clean error, not silently wrong creds.
-      if (/^eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(s)) {
+      // base64url with OPTIONAL `=` padding on each segment. Most modern
+      // JWTs omit the `=`, but the spec allows it and a future server-side
+      // change could re-introduce it; either way it's still a valid token.
+      if (/^eyJ[A-Za-z0-9_-]{10,}={0,2}\.[A-Za-z0-9_-]+={0,2}\.[A-Za-z0-9_-]+={0,2}$/.test(s)) {
         jwt = s;
         break;
       }

@@ -126,6 +126,19 @@ export async function prepareLogin(opts: LoginOptions = {}): Promise<PreparedLog
     loginHint: opts.loginHint,
   });
 
+  // Pre-register the waiter BEFORE opening the browser. There's a real race
+  // here: the user might already be signed in to windsurf.com, in which
+  // case the Auth0 SPA round-trips in <50ms — fast enough that the loopback
+  // callback can hit /auth before opencode gets back into our awaitToken()
+  // and calls server.callback(state). The matchedWaiter check at the
+  // request handler would then return "Unexpected callback" + leave
+  // captured=null, deadlocking awaitToken until its 5-minute timeout.
+  //
+  // By starting the waiter promise here we ensure a matching waiter is
+  // queued before any HTTP request can land. awaitToken just awaits the
+  // already-running promise.
+  const callbackPromise = server.callback(state);
+
   // Open the system browser pointed at the sign-in URL. We do this in
   // prepareLogin (not awaitToken) because opencode invokes authorize()
   // synchronously, prints the URL, and only THEN polls callback(). If we
@@ -161,8 +174,11 @@ export async function prepareLogin(opts: LoginOptions = {}): Promise<PreparedLog
     cancel,
     awaitToken: async () => {
       try {
+        // Await the waiter we already registered up top — NOT a fresh
+        // server.callback() call. The pre-registration closes the race
+        // window between openBrowser firing and the waiter being queued.
         const callback = await waitWithTimeout(
-          server.callback(state),
+          callbackPromise,
           timeoutMs,
           opts.signal,
           'Sign-in timed out — try again and complete the browser flow within 5 minutes.',
