@@ -20,6 +20,29 @@
 
 import type { OAuthLoginResult, WindsurfRegion } from './types.js';
 
+/**
+ * Polyfill for `AbortSignal.any` — composes multiple signals so the result
+ * aborts when ANY input aborts. Built-in in Node ≥20.3 / Bun ≥1.0; we
+ * implement the fallback ourselves so the timeout/caller-signal merge
+ * works on every runtime our `engines` field permits (Node 18+).
+ */
+function anySignal(signals: AbortSignal[]): AbortSignal {
+  const builtin = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any;
+  if (typeof builtin === 'function') return builtin(signals);
+  const controller = new AbortController();
+  const onAbort = (reason: unknown): void => {
+    if (!controller.signal.aborted) controller.abort(reason);
+  };
+  for (const s of signals) {
+    if (s.aborted) {
+      onAbort(s.reason);
+      break;
+    }
+    s.addEventListener('abort', () => onAbort(s.reason), { once: true });
+  }
+  return controller.signal;
+}
+
 interface RegisterUserResponseJson {
   api_key?: string;
   name?: string;
@@ -69,14 +92,14 @@ export async function registerUser(
 
   // 30s internal timeout — RegisterUser responds in ~200ms in steady state.
   // CLI users on flaky networks need bounded waits or the sign-in command
-  // hangs forever. Compose with caller signal via AbortSignal.any when
-  // available.
+  // hangs forever. Compose with the caller's signal via a small polyfill
+  // (`anySignal`) because Node 18 / older Bun lack AbortSignal.any; the
+  // previous fallback `combinedSignal = abortSignal` would drop the
+  // timeout entirely on those runtimes.
   const timeoutSignal = AbortSignal.timeout(30_000);
-  let combinedSignal: AbortSignal = timeoutSignal;
-  if (abortSignal) {
-    const anyFn = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
-    combinedSignal = typeof anyFn === 'function' ? anyFn([abortSignal, timeoutSignal]) : abortSignal;
-  }
+  const combinedSignal: AbortSignal = abortSignal
+    ? anySignal([abortSignal, timeoutSignal])
+    : timeoutSignal;
 
   const response = await fetch(url, {
     method: 'POST',

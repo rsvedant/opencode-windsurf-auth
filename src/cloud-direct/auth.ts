@@ -164,6 +164,14 @@ interface CacheEntry {
  */
 let cache: CacheEntry | null = null;
 const inFlight = new Map<string, Promise<MintedUserJwt>>();
+/**
+ * Monotonic epoch counter. Incremented on every `clearCachedUserJwt()`
+ * call so an in-flight mint that started BEFORE the clear can't
+ * repopulate the cache after-the-fact. Without this, a logout that
+ * happened concurrently with a mint would silently get its just-
+ * invalidated JWT cached and served for the next ~24 minutes.
+ */
+let cacheEpoch = 0;
 
 function flightKey(apiKey: string, host: string): string {
   return `${host}\x1f${apiKey}`;
@@ -185,9 +193,15 @@ export async function getCachedUserJwt(apiKey: string, host: string = DEFAULT_HO
   if (existing) return (await existing).jwt;
   const promise = mintUserJwt(apiKey, host, signal);
   inFlight.set(key, promise);
+  // Snapshot the epoch BEFORE awaiting the mint. If clearCachedUserJwt()
+  // fires while we're awaiting (logout-during-mint), the epoch changes
+  // and we won't repopulate the cache with the just-invalidated JWT.
+  const epochAtStart = cacheEpoch;
   try {
     const minted = await promise;
-    cache = { jwt: minted.jwt, expiresAt: minted.expiresAt, apiKey, host };
+    if (cacheEpoch === epochAtStart) {
+      cache = { jwt: minted.jwt, expiresAt: minted.expiresAt, apiKey, host };
+    }
     return minted.jwt;
   } finally {
     inFlight.delete(key);
@@ -197,9 +211,12 @@ export async function getCachedUserJwt(apiKey: string, host: string = DEFAULT_HO
 /**
  * Drop the in-memory JWT cache. Call after credential changes (logout,
  * account switch) so long-running opencode processes don't keep using a
- * JWT minted from a now-invalid api_key.
+ * JWT minted from a now-invalid api_key. Also bumps the cache epoch so
+ * any in-flight mint racing with this clear can't repopulate cache
+ * with the stale JWT after-the-fact.
  */
 export function clearCachedUserJwt(): void {
   cache = null;
   inFlight.clear();
+  cacheEpoch++;
 }

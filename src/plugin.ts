@@ -332,7 +332,14 @@ function createStreamingResponse(
               debugLog.log('[windsurf-plugin] dropping orphan tool_call_args (no preceding tool_call_start)');
               continue;
             }
-            const idx = toolIdToIndex.get(lastToolCallId) ?? toolCallIndex;
+            // Prefer the id carried on this frame (when present) over the
+            // rolling lastToolCallId. Cognition only sets the id on start
+            // frames today, so most argsDelta events carry no id and we
+            // attribute them to the most recent start — but if future
+            // wire-format changes ever interleave args across calls, an
+            // explicit id lets us route correctly.
+            const routeKey = ev.id ?? lastToolCallId;
+            const idx = toolIdToIndex.get(routeKey) ?? toolCallIndex;
             const chunk = {
               id: responseId,
               object: 'chat.completion.chunk' as const,
@@ -497,8 +504,6 @@ async function createNonStreamingResponse(
       collectedToolCalls.push(currentToolCall);
     } else if (ev.kind === 'tool_call_args') {
       if (currentToolCall) currentToolCall.args += ev.argsDelta;
-    } else if (ev.kind === 'tool_call_end') {
-      currentToolCall = null;
     } else if (ev.kind === 'finish') {
       finishReason = ev.reason;
     } else if (ev.kind === 'usage') {
@@ -690,6 +695,41 @@ function getGlobalKey(): string {
  * `~/.codeium/config.json`) or know the per-process PROXY_SECRET (only
  * in our heap). DNS-rebinding browser tabs are blocked by Origin check.
  */
+/**
+ * Memoized apiKey loaded from `credentials.json`. The Bearer-validation
+ * path runs on every chat request; without memoization a 100-turn
+ * session hits the disk 100× (and worse under parallel tool calls).
+ *
+ * TTL is intentionally short (2s) so credential rotation propagates
+ * promptly — if the user logs out + back in mid-session, the next
+ * request after 2s sees the new key. clearAuthCache() can force a
+ * refresh sooner (called from the logout path).
+ */
+const AUTH_CACHE_TTL_MS = 2_000;
+let authCacheValue: string | null = null;
+let authCacheExpiry = 0;
+
+function getAuthCacheEntry(): string | null {
+  const now = Date.now();
+  if (now < authCacheExpiry) return authCacheValue;
+  const creds = loadOAuthCredentials();
+  authCacheValue = creds && typeof creds.apiKey === 'string' && creds.apiKey.length > 0
+    ? creds.apiKey
+    : null;
+  authCacheExpiry = now + AUTH_CACHE_TTL_MS;
+  return authCacheValue;
+}
+
+/**
+ * Drop the memoized apiKey immediately. Called from the loader's logout
+ * branch so a `opencode auth logout windsurf` invalidation can't keep
+ * authorizing requests for up to 2s afterward.
+ */
+function clearAuthCache(): void {
+  authCacheValue = null;
+  authCacheExpiry = 0;
+}
+
 function authorizeProxyRequest(req: Request): Response | null {
   // 1. Origin gate (HARD) — block browser tabs claiming a foreign origin.
   const origin = req.headers.get('origin');
@@ -732,13 +772,21 @@ function authorizeProxyRequest(req: Request): Response | null {
     return null;
   }
 
-  // Otherwise, check the persisted credentials. We load lazily so a
-  // missing/corrupt file just fails this branch (the caller then sees
-  // 401 from the final return).
+  // Otherwise, check the persisted credentials. To avoid hammering disk
+  // (loadCredentials does existsSync+lstat+stat+chmod+read+parse on every
+  // request — N chat turns = N FS hits, serializing under parallel
+  // tool-loop pressure), we cache the loaded apiKey for a short TTL.
+  // The TTL is short enough that a credential rotation propagates within
+  // a few seconds — if a user logs out + back in mid-session, the next
+  // request after the TTL will see the new key. Inside the TTL, we use
+  // the memoized value AND validate the Bearer against it; this also
+  // closes the TOCTOU window where the auth gate validated key-A but
+  // the chat handler then read key-B from disk a moment later (now
+  // both reads share the cache).
   try {
-    const creds = loadOAuthCredentials();
-    if (creds && typeof creds.apiKey === 'string' && creds.apiKey.length > 0) {
-      const credBuf = Buffer.from(creds.apiKey, 'utf8');
+    const cached = getAuthCacheEntry();
+    if (cached) {
+      const credBuf = Buffer.from(cached, 'utf8');
       if (
         presentedBuf.length === credBuf.length &&
         crypto.timingSafeEqual(presentedBuf, credBuf)
@@ -1220,7 +1268,10 @@ export const createWindsurfPlugin =
 
             if (opencodeKey) {
               // opencode has a key. Sync into credentials.json if file is
-              // missing or stale.
+              // missing or stale. Preserve `syncedViaOpencodeAuth` from the
+              // existing file if explicitly set to `false` (CLI-managed
+              // creds want to survive opencode logout). Default to `true`
+              // when the file is new or had no flag.
               if (!existing || existing.apiKey !== opencodeKey) {
                 const { saveCredentials } = await import('./oauth/storage.js');
                 const { DEFAULT_REGION } = await import('./oauth/types.js');
@@ -1230,7 +1281,7 @@ export const createWindsurfPlugin =
                   apiServerUrl: existing?.apiServerUrl ?? 'https://server.codeium.com',
                   issuedAt: new Date().toISOString(),
                   oauthClientId: DEFAULT_REGION.oauthClientId,
-                  syncedViaOpencodeAuth: true,
+                  syncedViaOpencodeAuth: existing?.syncedViaOpencodeAuth ?? true,
                 });
               }
             } else if (existing?.syncedViaOpencodeAuth) {
@@ -1239,19 +1290,35 @@ export const createWindsurfPlugin =
               // chat path stops accepting the stale token.
               const { deleteCredentials } = await import('./oauth/storage.js');
               deleteCredentials();
-              // Also drop the in-memory JWT cache so a long-running
-              // opencode process doesn't keep using the just-invalidated
-              // api_key for the next 24min.
+              // Also drop the in-memory JWT cache + auth cache so a
+              // long-running opencode process doesn't keep using the
+              // just-invalidated api_key for the next 2s (auth cache)
+              // or 24 min (JWT cache).
               try {
                 const { clearCachedUserJwt } = await import('./cloud-direct/auth.js');
                 clearCachedUserJwt();
                 const { clearSessionIds } = await import('./cloud-direct/chat.js');
                 clearSessionIds();
+                clearAuthCache();
               } catch { /* best-effort */ }
             }
             // (otherwise leave credentials.json alone — likely written by our
             // standalone CLI without opencode involvement.)
-          } catch { /* loader must never throw */ }
+          } catch (loaderErr) {
+            // The loader contract requires us not to throw — an exception
+            // here would crash opencode's plugin host. But silently
+            // swallowing storage failures used to mean a failed
+            // `saveCredentials` or `deleteCredentials` left opencode
+            // reporting "logged in" / "logged out" while credentials.json
+            // disagreed (and the proxy auth gate then trusted the stale
+            // state). Surface to debugLog so users running with
+            // WINDSURF_PLUGIN_DEBUG=1 see the cause, AND emit a single
+            // console.warn so the bare CLI also gets a visible hint.
+            try {
+              debugLog.log('[windsurf-plugin] loader credential-sync failed:', loaderErr instanceof Error ? loaderErr.message : loaderErr);
+              process.stderr.write(`[opencode-windsurf-auth] credential sync failed: ${loaderErr instanceof Error ? loaderErr.message : String(loaderErr)}\n`);
+            } catch { /* */ }
+          }
           return {};
         },
 

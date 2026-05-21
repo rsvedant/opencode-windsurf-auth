@@ -380,8 +380,24 @@ export type CloudChatEvent =
   | { kind: 'text'; text: string }
   | { kind: 'reasoning'; text: string }
   | { kind: 'tool_call_start'; id: string; name: string }
-  | { kind: 'tool_call_args'; argsDelta: string }
-  | { kind: 'tool_call_end' }
+  | {
+      kind: 'tool_call_args';
+      argsDelta: string;
+      /**
+       * Tool-call id this delta belongs to, when the cloud surfaced one in
+       * this frame. Cognition's wire format only carries id on the START
+       * frame today, so most argsDelta events arrive without one — callers
+       * route those to the most-recent-start by convention. If Cognition
+       * ever interleaves args across calls, the consumer should prefer
+       * `id` over the rolling lastToolCallId.
+       */
+      id?: string;
+    }
+  // Note: there is no `tool_call_end` event. Cognition's wire format
+  // signals the end of a tool call implicitly — args just stop arriving
+  // for the current id and either a new `tool_call_start` fires or the
+  // stream finishes. Consumers should treat each `tool_call_start` as
+  // ending the previous call.
   | { kind: 'finish'; reason: 'stop' | 'tool_calls' | 'length' | 'content_filter' }
   | {
       kind: 'usage';
@@ -592,7 +608,11 @@ function* decodeChatFrame(proto: Buffer): Generator<CloudChatEvent> {
         yield { kind: 'tool_call_start', id, name };
       }
       if (argsDelta !== undefined) {
-        yield { kind: 'tool_call_args', argsDelta };
+        // Pass through `id` when this frame carries one (Cognition only
+        // sets it on the start frame today, but defending against future
+        // interleaving). Callers should prefer `id` over their rolling
+        // lastToolCallId when both are available.
+        yield { kind: 'tool_call_args', argsDelta, ...(id !== undefined ? { id } : {}) };
       }
     } else if (f.num === 5 && f.wire === 0) {
       const v = Number(f.value);
@@ -891,9 +911,18 @@ export async function* streamChatEvents(req: CloudChatRequest): AsyncGenerator<C
         () => idleController.abort(new Error(`cloud-direct: idle timeout (${CLOUD_STREAM_IDLE_MS}ms with no bytes)`)),
         CLOUD_STREAM_IDLE_MS,
       );
-      // Race the reader.read() against idle abort.
+      // Race the reader.read() against idle abort. When abort wins, we
+      // also actively `cancel()` the underlying body stream so the
+      // pending read() resolves promptly with done=true instead of
+      // hanging on the now-dead TCP socket until the OS notices. The
+      // previous behavior left the read pending and produced flaky
+      // unhandled-rejection warnings during cleanup.
       return new Promise((resolve, reject) => {
-        idleController.signal.addEventListener('abort', () => reject(idleController.signal.reason ?? new Error('idle abort')), { once: true });
+        idleController.signal.addEventListener('abort', () => {
+          // Force the reader's read() to settle.
+          try { void resp.body?.cancel(idleController.signal.reason ?? new Error('idle abort')); } catch { /* */ }
+          reject(idleController.signal.reason ?? new Error('idle abort'));
+        }, { once: true });
         reader.read().then(resolve, reject);
       });
     };

@@ -1098,8 +1098,19 @@ export function isModelSupported(modelName: string): boolean {
 }
 
 /** Default canonical model */
+/**
+ * Default model returned by `getDefaultModel()`. The catalog snapshot
+ * lists `swe-1.6` as a free, currently-served model — it's the safest
+ * default for opencode calls that drop `request.model` (title gen,
+ * summaries). The previous default of `claude-3.5-sonnet` resolved to a
+ * legacy enum the Cognition cloud no longer accepts, so any
+ * model-less request would fail with the misleading `"an internal
+ * error occurred"` trailer.
+ */
+const DEFAULT_MODEL_ID = 'swe-1.6';
+
 export function getDefaultModel(): string {
-  return 'claude-3.5-sonnet';
+  return DEFAULT_MODEL_ID;
 }
 
 export function getDefaultModelEnum(): ModelEnumValue {
