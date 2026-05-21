@@ -222,10 +222,29 @@ async function main(): Promise<number> {
   }
 }
 
+/**
+ * Flush stdout/stderr fully before process.exit. Without this, the last few
+ * lines of output (especially error messages on failed login) can be lost
+ * on macOS when stdout is piped or redirected.
+ */
+async function flushStreams(): Promise<void> {
+  const drain = (s: NodeJS.WriteStream): Promise<void> =>
+    new Promise<void>((resolve) => {
+      // .write returns false when buffered; wait for drain. If everything's
+      // already flushed, resolve immediately on the next tick.
+      if (s.writableLength === 0) { setImmediate(resolve); return; }
+      s.once('drain', () => resolve());
+      // Safety net so we never block forever on a closed pipe.
+      setTimeout(resolve, 100).unref();
+    });
+  await Promise.all([drain(process.stdout), drain(process.stderr)]);
+}
+
 main().then(
-  (code) => process.exit(code),
-  (err) => {
+  async (code) => { await flushStreams(); process.exit(code); },
+  async (err) => {
     console.error('Fatal:', err);
+    await flushStreams();
     process.exit(1);
   },
 );

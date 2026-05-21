@@ -27,13 +27,20 @@ import type { Auth } from '@opencode-ai/sdk';
 // ~/.cache/opencode-windsurf-auth/plugin.log so they're easy to tail.
 const debugLog = (() => {
   const enabled = !!process.env.WINDSURF_PLUGIN_DEBUG;
+  // Debug log lives under tmp; tighten permissions to 0700 dir + 0600 file
+  // since the log mirrors request bodies (system prompts, tool schemas,
+  // sometimes prompt content) and we'd rather not have it world-readable
+  // on shared multi-user hosts.
   const dir = path.join(os.tmpdir(), 'opencode-windsurf-auth-debug');
   let writeStream: fs.WriteStream | null = null;
   if (enabled) {
     try {
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       const p = path.join(dir, `plugin.${process.pid}.log`);
-      writeStream = fs.createWriteStream(p, { flags: 'a' });
+      writeStream = fs.createWriteStream(p, { flags: 'a', mode: 0o600 });
+      // Re-chmod in case createWriteStream's mode arg was ignored (Node
+      // versions differ on whether `mode` is honored on append-open).
+      try { fs.chmodSync(p, 0o600); } catch { /* ok */ }
       writeStream.write(`\n=== plugin loaded at ${new Date().toISOString()} pid=${process.pid} ===\n`);
     } catch { /* don't crash on log-init failure */ }
   }
@@ -48,7 +55,7 @@ const debugLog = (() => {
     },
   };
 })();
-import { isWindsurfRunning, WindsurfCredentials, WindsurfError } from './plugin/auth.js';
+import { WindsurfCredentials, WindsurfError } from './plugin/auth.js';
 import { resolveCredentials } from './plugin/credentials-resolver.js';
 import { loadCredentials as loadOAuthCredentials } from './oauth/storage.js';
 import type { ChatHistoryItem } from './cloud-direct/index.js';
@@ -69,6 +76,14 @@ interface ChatCompletionRequest {
   messages: Array<{
     role: string;
     content: string | Array<{ type: string; text?: string }>;
+    /** Present on `role:'tool'` messages — the call id this result answers. */
+    tool_call_id?: string;
+    /** Present on `role:'assistant'` messages — tools the assistant called. */
+    tool_calls?: Array<{
+      id?: string;
+      type?: string;
+      function?: { name?: string; arguments?: string };
+    }>;
   }>;
   stream?: boolean;
   temperature?: number;
@@ -85,6 +100,35 @@ interface ChatCompletionRequest {
 }
 
 type ToolDef = NonNullable<ChatCompletionRequest['tools']>[number];
+
+/**
+ * Map an opencode/OpenAI-shaped chat message into the ChatHistoryItem the
+ * cloud-direct encoder expects. Importantly, this preserves `tool_call_id`
+ * (for role:'tool' results) and `tool_calls` (for role:'assistant' calls)
+ * — the encoder uses both to populate ChatMessagePrompt fields #6 and #7
+ * so the cloud can pair multi-tool conversations. Previously these were
+ * silently dropped, causing the model to lose track of which tool call
+ * produced which result.
+ */
+function mapMessageToHistoryItem(m: ChatCompletionRequest['messages'][number]): ChatHistoryItem {
+  const item: ChatHistoryItem = {
+    role: m.role as ChatHistoryItem['role'],
+    content: m.content as ChatHistoryItem['content'],
+  };
+  if (m.role === 'tool' && typeof m.tool_call_id === 'string' && m.tool_call_id.length > 0) {
+    item.tool_call_id = m.tool_call_id;
+  }
+  if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+    item.tool_calls = m.tool_calls
+      .map((tc) => ({
+        id: typeof tc.id === 'string' ? tc.id : '',
+        name: typeof tc.function?.name === 'string' ? tc.function.name : '',
+        arguments: typeof tc.function?.arguments === 'string' ? tc.function.arguments : '',
+      }))
+      .filter((tc) => tc.id !== '' && tc.name !== '');
+  }
+  return item;
+}
 
 function extractVariantFromProviderOptions(providerOptions: Record<string, unknown> | undefined): string | undefined {
   if (!providerOptions) return undefined;
@@ -156,11 +200,16 @@ function createStreamingResponse(
         // The OpenAI request shape allows wider element shapes than
         // cloud-direct's ContentPart; normalizeContent re-validates server
         // side, so cast through the public ChatHistoryItem type.
-        const multimodalMessages: ChatHistoryItem[] = request.messages.map((m) => ({
-          role: m.role as ChatHistoryItem['role'],
-          content: m.content as ChatHistoryItem['content'],
-        }));
+        const multimodalMessages: ChatHistoryItem[] = request.messages.map((m) => mapMessageToHistoryItem(m));
         let toolCallIndex = -1;
+        // Map from cloud's tool-call id → the index we assigned it in the
+        // OpenAI-shaped output. Cloud streams args by id; we need to route
+        // each argsDelta to the right index when calls interleave (parallel
+        // tool calls — Claude Sonnet 4.6+ and OpenAI parallel-tools both
+        // support this). Without this map, args from a later call would
+        // overwrite an earlier call's index.
+        const toolIdToIndex = new Map<string, number>();
+        let lastToolCallId: string | undefined;
         let finishReason: 'stop' | 'tool_calls' | 'length' | 'content_filter' | null = null;
         let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | null = null;
         let firstChunkSent = false;
@@ -236,28 +285,40 @@ function createStreamingResponse(
             firstChunkSent = true;
           } else if (ev.kind === 'tool_call_start') {
             toolCallIndex += 1;
+            toolIdToIndex.set(ev.id, toolCallIndex);
+            lastToolCallId = ev.id;
+            // delta.role belongs ONLY on the first chunk of an assistant
+            // turn per OpenAI streaming spec. Previously we hard-coded
+            // role:'assistant' on every tool_call_start, which violated
+            // the convention and could trip ai-sdk parsers that reject
+            // mid-stream role re-assignment.
+            const baseDelta = {
+              tool_calls: [{
+                index: toolCallIndex,
+                id: ev.id,
+                type: 'function',
+                function: { name: ev.name, arguments: '' },
+              }],
+            };
+            const delta = firstChunkSent ? baseDelta : { role: 'assistant', ...baseDelta };
             const chunk = {
               id: responseId,
               object: 'chat.completion.chunk' as const,
               created: Math.floor(Date.now() / 1000),
               model: requestedModel,
-              choices: [{
-                index: 0,
-                delta: {
-                  role: 'assistant',
-                  tool_calls: [{
-                    index: toolCallIndex,
-                    id: ev.id,
-                    type: 'function',
-                    function: { name: ev.name, arguments: '' },
-                  }],
-                },
-                finish_reason: null,
-              }],
+              choices: [{ index: 0, delta, finish_reason: null }],
             };
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
             firstChunkSent = true;
           } else if (ev.kind === 'tool_call_args') {
+            // Route the args to the LAST started tool-call's index. The
+            // cloud always pairs args with the most recent start event in
+            // its current stream, but if a future model interleaves args
+            // across calls the id-based map (toolIdToIndex) is what we'd
+            // key on. lastToolCallId tracks the current target.
+            const idx = lastToolCallId !== undefined
+              ? (toolIdToIndex.get(lastToolCallId) ?? Math.max(0, toolCallIndex))
+              : Math.max(0, toolCallIndex);
             const chunk = {
               id: responseId,
               object: 'chat.completion.chunk' as const,
@@ -267,7 +328,7 @@ function createStreamingResponse(
                 index: 0,
                 delta: {
                   tool_calls: [{
-                    index: Math.max(0, toolCallIndex),
+                    index: idx,
                     function: { arguments: ev.argsDelta },
                   }],
                 },
@@ -384,10 +445,7 @@ async function createNonStreamingResponse(
     parameters: t.function?.parameters ?? {},
   }));
 
-  const multimodalMessages: ChatHistoryItem[] = request.messages.map((m) => ({
-    role: m.role as ChatHistoryItem['role'],
-    content: m.content as ChatHistoryItem['content'],
-  }));
+  const multimodalMessages: ChatHistoryItem[] = request.messages.map((m) => mapMessageToHistoryItem(m));
 
   const { streamChatEvents } = await import('./cloud-direct/index.js');
 
@@ -399,6 +457,14 @@ async function createNonStreamingResponse(
   let collected = '';
   let finishReason: 'stop' | 'tool_calls' | 'length' | 'content_filter' = 'stop';
   let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | null = null;
+  // tool_calls in non-streaming responses get fully assembled (id+name+args)
+  // before serialization. opencode-side, ai-sdk's non-stream consumer reads
+  // these from `choices[0].message.tool_calls`, so dropping them used to
+  // make `stream: false` requests effectively return empty assistant turns
+  // when the model wanted to call a tool. Now they round-trip.
+  type CollectedToolCall = { id: string; name: string; args: string };
+  const collectedToolCalls: CollectedToolCall[] = [];
+  let currentToolCall: CollectedToolCall | null = null;
 
   for await (const ev of streamChatEvents({
     apiKey: credentials.apiKey,
@@ -412,6 +478,13 @@ async function createNonStreamingResponse(
   })) {
     if (ev.kind === 'text') {
       collected += ev.text;
+    } else if (ev.kind === 'tool_call_start') {
+      currentToolCall = { id: ev.id, name: ev.name, args: '' };
+      collectedToolCalls.push(currentToolCall);
+    } else if (ev.kind === 'tool_call_args') {
+      if (currentToolCall) currentToolCall.args += ev.argsDelta;
+    } else if (ev.kind === 'tool_call_end') {
+      currentToolCall = null;
     } else if (ev.kind === 'finish') {
       finishReason = ev.reason;
     } else if (ev.kind === 'usage') {
@@ -421,12 +494,41 @@ async function createNonStreamingResponse(
         totalTokens: ev.totalTokens,
       };
     }
-    // Tool-call and reasoning events are intentionally dropped for the
-    // non-streaming path — opencode only consumes the text payload from a
-    // synchronous completion (e.g. title generation).
+    // Reasoning events are intentionally dropped for the non-streaming
+    // path — opencode only consumes visible content from a synchronous
+    // completion (title generation, etc).
+  }
+  // Promote "I emitted tool calls" to a tool_calls finish reason so the
+  // downstream consumer routes us through the tool-execution loop.
+  if (collectedToolCalls.length > 0 && finishReason === 'stop') {
+    finishReason = 'tool_calls';
   }
 
   const created = Math.floor(Date.now() / 1000);
+  // Build the assistant message, attaching tool_calls if any were collected
+  // during the stream. Shape matches OpenAI's chat.completion response.
+  const assistantMessage:
+    | { role: 'assistant'; content: string }
+    | {
+        role: 'assistant';
+        content: string;
+        tool_calls: Array<{
+          id: string;
+          type: 'function';
+          function: { name: string; arguments: string };
+        }>;
+      } =
+    collectedToolCalls.length > 0
+      ? {
+          role: 'assistant',
+          content: collected,
+          tool_calls: collectedToolCalls.map((tc) => ({
+            id: tc.id,
+            type: 'function' as const,
+            function: { name: tc.name, arguments: tc.args },
+          })),
+        }
+      : { role: 'assistant', content: collected };
   const response: ChatCompletionResponse & { usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } } = {
     id: responseId,
     object: 'chat.completion',
@@ -435,7 +537,7 @@ async function createNonStreamingResponse(
     choices: [
       {
         index: 0,
-        message: { role: 'assistant', content: collected },
+        message: assistantMessage,
         finish_reason: finishReason,
       },
     ],
@@ -451,37 +553,113 @@ async function createNonStreamingResponse(
 }
 
 // ============================================================================
-// Local Proxy Server (like cursor-auth pattern)
+// Local Proxy Server
 // ============================================================================
+//
+// Security model (replaces the previous fixed-port-with-/health-adoption
+// design, which was open to two attacks: any local process or browser tab
+// could POST to 127.0.0.1:42100 without auth, and a hostile process could
+// race-bind 42100 first and impersonate our proxy via a forged /health
+// build marker).
+//
+// Now:
+//   1. We always bind a RANDOM ephemeral port (`port: 0`). No fixed port,
+//      no cross-process adoption, no "stale squatter" possibility.
+//   2. At plugin load we generate a 256-bit per-process shared secret
+//      (PROXY_SECRET). The `chat.params` hook injects it into opencode's
+//      provider options as `apiKey`; opencode's @ai-sdk/openai-compatible
+//      adapter sends it as `Authorization: Bearer <secret>` on every call.
+//   3. The proxy rejects any /v1/* request whose Authorization header
+//      doesn't match the in-process secret. Hostile local processes and
+//      DNS-rebinding browser tabs lose access because they don't know it.
+//   4. We also Origin-gate browser-shaped requests: any Origin header that
+//      isn't a loopback origin is rejected with 403. opencode itself runs
+//      server-side and omits Origin, so this only fires for hostile pages.
+//   5. /health stays unauthenticated but returns only `{ok: true}` — no
+//      pid, no oauth status, no build marker (nothing to spoof).
 
 const WINDSURF_PROXY_HOST = '127.0.0.1';
-const WINDSURF_PROXY_DEFAULT_PORT = 42100;
+
 /**
- * Bump when the proxy's request/response wire format changes so old squatter
- * proxies don't get reused by new opencode invocations. The `/health` endpoint
- * returns this; ensureWindsurfProxyServer refuses adoption on mismatch.
+ * 256-bit hex secret minted once per plugin-host process. Lives in module
+ * scope so every call into the proxy from the same opencode runtime sees
+ * the same value. Subprocesses and outside attackers can't observe it.
  */
-const WINDSURF_PROXY_BUILD = 'cloud-direct.1';
+const PROXY_SECRET: string = crypto.randomBytes(32).toString('hex');
 
 /**
  * Per-process proxy registry slot. Stashed on `globalThis` so concurrent
  * plugin loads in the same Node/Bun process share one proxy server instead of
  * racing to bind the same port. `startup` holds the in-flight promise during
- * the initial bind so concurrent callers await the same outcome.
+ * the initial bind so concurrent callers await the same outcome. The key is
+ * version-suffixed so two coexisting plugin versions (e.g. in a monorepo)
+ * don't share each other's proxy.
  */
 interface ProxyRegistrySlot {
   baseURL: string;
   startup?: Promise<string>;
 }
 interface WindsurfPluginGlobals {
-  __opencode_windsurf_proxy_server__?: ProxyRegistrySlot;
   /** Bun runtime detection — undefined under vanilla Node. */
   Bun?: { serve(opts: unknown): { port: number } };
 }
 const globals = globalThis as unknown as WindsurfPluginGlobals;
+const slotRegistry = globalThis as unknown as Record<string, ProxyRegistrySlot | undefined>;
 
-function getGlobalKey(): '__opencode_windsurf_proxy_server__' {
-  return '__opencode_windsurf_proxy_server__';
+const PLUGIN_VERSION: string = (() => {
+  // Read once at module load — used to namespace the global slot key so
+  // multiple plugin versions in the same process don't fight.
+  try {
+    // Synthesized version string; the build pipeline doesn't ship our
+    // package.json next to dist/, so we fall back to the wire-format tag.
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as { version?: string };
+    return typeof pkg.version === 'string' ? pkg.version : 'cloud-direct.1';
+  } catch {
+    return 'cloud-direct.1';
+  }
+})();
+
+function getGlobalKey(): string {
+  return `__opencode_windsurf_proxy_server__${PLUGIN_VERSION}`;
+}
+
+/**
+ * Validate that an incoming request really came from opencode-in-this-process
+ * (Authorization header matches our secret) and not from a hostile browser tab
+ * (Origin is empty or a loopback origin). Returns null if ok; a `Response` to
+ * return-early if blocked.
+ */
+function authorizeProxyRequest(req: Request): Response | null {
+  // 1. Authorization header must match the per-process secret.
+  const authHeader = req.headers.get('authorization') ?? '';
+  const expected = `Bearer ${PROXY_SECRET}`;
+  // Constant-time compare to avoid leaking the secret via timing. (Length
+  // mismatch obviously short-circuits, but for matched-length attempts the
+  // CPU work is constant per byte.)
+  const ok =
+    authHeader.length === expected.length &&
+    crypto.timingSafeEqual(Buffer.from(authHeader), Buffer.from(expected));
+  if (!ok) {
+    return openAIError(401, 'Unauthorized: this proxy only accepts requests from the loopback opencode runtime that loaded it.');
+  }
+
+  // 2. Origin header (if present) must be a loopback origin. opencode's
+  //    server-side fetch omits Origin; only browsers attach it, and only
+  //    same-host browser code can validly hit us.
+  const origin = req.headers.get('origin');
+  if (origin) {
+    let url: URL | null = null;
+    try { url = new URL(origin); } catch { /* fall through */ }
+    const allowed =
+      url &&
+      (url.protocol === 'http:' || url.protocol === 'https:') &&
+      (url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]');
+    if (!allowed) {
+      return openAIError(403, `Forbidden: cross-origin requests are not allowed (Origin=${origin}).`);
+    }
+  }
+
+  return null;
 }
 
 function openAIError(status: number, message: string, details?: string): Response {
@@ -502,7 +680,7 @@ async function ensureWindsurfProxyServer(): Promise<string> {
   const key = getGlobalKey();
 
   // Return existing server URL if already started.
-  const slot = globals[key];
+  const slot = slotRegistry[key];
   if (slot && typeof slot.baseURL === 'string' && slot.baseURL.length > 0) {
     return slot.baseURL;
   }
@@ -516,26 +694,22 @@ async function ensureWindsurfProxyServer(): Promise<string> {
     try {
       const url = new URL(req.url);
 
-      // Health check endpoint — includes a build marker so opencode can
-      // detect whether the squatter on port 42100 is OUR version of the
-      // plugin. Bump WINDSURF_PROXY_BUILD when shipping a wire-format
-      // change; new invocations whose plugin code differs will refuse to
-      // adopt the running proxy and bind a random port instead.
+      // /health is unauthenticated by design — it's only meant to be a
+      // "yes, the proxy is up" probe. It carries no PID, no oauth state,
+      // no version marker — there is nothing here for an attacker to
+      // observe or spoof. (The previous build-marker-based adoption was
+      // removed; see the security-model block at the top of this file.)
       if (url.pathname === '/health') {
-        const hasOAuth = (() => {
-          try { return loadOAuthCredentials() !== null; } catch { return false; }
-        })();
         return new Response(
-          JSON.stringify({
-            ok: true,
-            windsurf: isWindsurfRunning(),
-            oauth: hasOAuth,
-            build: WINDSURF_PROXY_BUILD,
-            pid: process.pid,
-          }),
+          JSON.stringify({ ok: true }),
           { status: 200, headers: { 'Content-Type': 'application/json' } },
         );
       }
+
+      // Every other endpoint requires the per-process Bearer secret +
+      // loopback origin.
+      const blocked = authorizeProxyRequest(req);
+      if (blocked) return blocked;
 
       // Models endpoint
       if (url.pathname === '/v1/models' || url.pathname === '/models') {
@@ -568,6 +742,26 @@ async function ensureWindsurfProxyServer(): Promise<string> {
       // Chat completions endpoint
       if (url.pathname === '/v1/chat/completions' || url.pathname === '/chat/completions') {
         try {
+          // Method gate — only POST.
+          if (req.method !== 'POST') {
+            return openAIError(405, `Method ${req.method} not allowed; use POST.`);
+          }
+          // Content-Type gate — refuse anything that isn't JSON. (Useful
+          // defense-in-depth against confused-deputy attacks where an
+          // attacker tricks the local proxy into parsing form-encoded
+          // junk as a chat request.)
+          const ct = (req.headers.get('content-type') ?? '').toLowerCase();
+          if (!ct.startsWith('application/json')) {
+            return openAIError(415, `Unsupported Content-Type: ${ct || '(empty)'}; expected application/json.`);
+          }
+          // Body size gate — opencode never sends >5MB request bodies
+          // (system prompts top out around 200KB). Reject anything 32MB+
+          // before we even try to parse it. Defense against accidental or
+          // hostile request-body floods.
+          const declaredLen = Number(req.headers.get('content-length') ?? '0');
+          if (declaredLen > 32 * 1024 * 1024) {
+            return openAIError(413, `Request body too large: ${declaredLen} bytes (max 32 MB).`);
+          }
           // resolveCredentials prefers OAuth (no Windsurf required) and falls
           // back to scraping the running Windsurf process. It throws a
           // descriptive WindsurfError if neither is available.
@@ -575,8 +769,21 @@ async function ensureWindsurfProxyServer(): Promise<string> {
           if (debugLog.enabled) {
             debugLog.log(`[windsurf-plugin] mode=${credentials.cloudDirect ? 'cloud-direct' : 'local-ls'} api=${credentials.apiServerUrl ?? '(default)'}`);
           }
-          const body = await req.json().catch(() => ({}));
-          const requestBody = body as ChatCompletionRequest;
+          // Reject malformed JSON cleanly (used to coerce to {} and 500
+          // when downstream .messages.map blew up).
+          let requestBody: ChatCompletionRequest;
+          try {
+            requestBody = (await req.json()) as ChatCompletionRequest;
+          } catch (parseErr) {
+            return openAIError(
+              400,
+              'Malformed request body — expected JSON.',
+              parseErr instanceof Error ? parseErr.message : String(parseErr),
+            );
+          }
+          if (!requestBody || typeof requestBody !== 'object' || !Array.isArray(requestBody.messages)) {
+            return openAIError(400, 'Malformed request body — `messages` must be an array.');
+          }
           const isStreaming = requestBody.stream === true;
 
           if (debugLog.enabled) {
@@ -655,29 +862,6 @@ async function ensureWindsurfProxyServer(): Promise<string> {
     if (debugLog.enabled) {
       debugLog.log(`[windsurf-plugin] ensureWindsurfProxyServer (hasBunServe=${hasBunServe})`);
     }
-    // If another instance is already serving on the default port AND its
-    // build marker matches our own, reuse it. Stale opencode-zombie procs
-    // can otherwise pin port 42100 with old plugin code (e.g. without
-    // cloud-direct support) and starve every subsequent invocation.
-    try {
-      const res = await fetch(
-        `http://${WINDSURF_PROXY_HOST}:${WINDSURF_PROXY_DEFAULT_PORT}/health`,
-      ).catch(() => null);
-      if (res && res.ok) {
-        try {
-          const j = await res.json() as { build?: string; pid?: number };
-          if (j.build === WINDSURF_PROXY_BUILD) {
-            debugLog.log(`[windsurf-plugin] adopting compatible proxy (pid=${j.pid}, build=${j.build})`);
-            return `http://${WINDSURF_PROXY_HOST}:${WINDSURF_PROXY_DEFAULT_PORT}/v1`;
-          }
-          debugLog.log(`[windsurf-plugin] refusing stale proxy build=${j.build} (ours=${WINDSURF_PROXY_BUILD}); will bind random port`);
-        } catch {
-          debugLog.log(`[windsurf-plugin] stale proxy /health unparsable; will bind random port`);
-        }
-      }
-    } catch {
-      /* ignore */
-    }
 
     const startBunServer = (port: number) =>
       bunServe!({
@@ -697,26 +881,74 @@ async function ensureWindsurfProxyServer(): Promise<string> {
         // Lazy-import to keep the module's top-level imports clean.
         import('http').then((nodeHttp) => {
           const srv = nodeHttp.createServer(async (req, res) => {
+            // 32 MB hard cap on inbound request bodies. opencode's largest
+            // legitimate request (huge system prompt + 100+ tools) maxes
+            // around 500 KB. A hostile localhost peer streaming a multi-GB
+            // body used to be able to drive us OOM via Buffer.concat.
+            const MAX_REQ_BODY_BYTES = 32 * 1024 * 1024;
+            // Per-request AbortController so we can propagate client-close
+            // through into our downstream handler (cloud-direct fetch).
+            const abort = new AbortController();
+            req.on('close', () => {
+              if (!res.writableEnded) abort.abort();
+            });
             try {
+              // Collect body bytes with a size cap. We track total size as
+              // we go and reject overruns immediately instead of buffering
+              // first and counting later.
               const chunks: Buffer[] = [];
-              await new Promise<void>((r) => req.on('data', (c) => chunks.push(Buffer.from(c))).on('end', r));
+              let total = 0;
+              let aborted = false;
+              await new Promise<void>((r, rej) => {
+                req.on('data', (c) => {
+                  if (aborted) return;
+                  const buf = Buffer.from(c);
+                  total += buf.length;
+                  if (total > MAX_REQ_BODY_BYTES) {
+                    aborted = true;
+                    rej(Object.assign(new Error('request body too large'), { httpStatus: 413 }));
+                    return;
+                  }
+                  chunks.push(buf);
+                });
+                req.on('end', r);
+                req.on('error', rej);
+                req.on('aborted', () => rej(Object.assign(new Error('client aborted'), { httpStatus: 499 })));
+              });
               const url = `http://${req.headers.host ?? WINDSURF_PROXY_HOST}${req.url ?? '/'}`;
               const headers = new Headers();
               for (const [k, v] of Object.entries(req.headers)) {
                 if (typeof v === 'string') headers.set(k, v);
                 else if (Array.isArray(v)) headers.set(k, v.join(', '));
               }
-              const init: RequestInit = { method: req.method, headers, body: chunks.length ? Buffer.concat(chunks) : undefined };
+              const init: RequestInit = {
+                method: req.method,
+                headers,
+                body: chunks.length ? Buffer.concat(chunks) : undefined,
+                signal: abort.signal,
+              };
               const r0 = new Request(url, init);
               const r1 = await handler(r0);
               res.statusCode = r1.status;
               r1.headers.forEach((v, k) => res.setHeader(k, v));
               if (r1.body) {
                 const reader = r1.body.getReader();
-                while (true) {
-                  const { value, done } = await reader.read();
-                  if (done) break;
-                  if (value) res.write(Buffer.from(value));
+                try {
+                  while (true) {
+                    if (abort.signal.aborted) {
+                      try { await reader.cancel(); } catch { /* */ }
+                      break;
+                    }
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    if (value) {
+                      // res.write returns false on backpressure — wait for drain
+                      const ok = res.write(Buffer.from(value));
+                      if (!ok) await new Promise<void>((r) => res.once('drain', r));
+                    }
+                  }
+                } finally {
+                  try { reader.releaseLock(); } catch { /* */ }
                 }
               } else {
                 const txt = await r1.text();
@@ -724,9 +956,10 @@ async function ensureWindsurfProxyServer(): Promise<string> {
               }
               res.end();
             } catch (e) {
+              const err = e as Error & { httpStatus?: number };
               try {
-                res.statusCode = 500;
-                res.end(`internal error: ${(e as Error).message}`);
+                res.statusCode = err.httpStatus ?? 500;
+                res.end(`error: ${err.message}`);
               } catch { /* socket already dead */ }
             }
           });
@@ -755,46 +988,23 @@ async function ensureWindsurfProxyServer(): Promise<string> {
       return startNodeServer(port);
     };
 
-    try {
-      const server = await startServer(WINDSURF_PROXY_DEFAULT_PORT);
-      if (debugLog.enabled) {
-        debugLog.log(`[windsurf-plugin] proxy listening on http://${WINDSURF_PROXY_HOST}:${server.port}/v1`);
-      }
-      return `http://${WINDSURF_PROXY_HOST}:${server.port}/v1`;
-    } catch (error) {
-      const code =
-        error instanceof Error && 'code' in error
-          ? (error as NodeJS.ErrnoException).code
-          : undefined;
-      debugLog.log(`[windsurf-plugin] startServer threw: ${(error as Error).message}, code=${code}`);
-      if (code !== 'EADDRINUSE') {
-        // Always fall back to a random port rather than dying. Plugin not
-        // loading kills the whole opencode session.
-        try {
-          const server = await startServer(0);
-          debugLog.log(`[windsurf-plugin] fallback random port ${server.port}`);
-          return `http://${WINDSURF_PROXY_HOST}:${server.port}/v1`;
-        } catch (e2) {
-          debugLog.log(`[windsurf-plugin] random-port fallback also failed: ${(e2 as Error).message}`);
-          throw error;
-        }
-      }
-
-      // EADDRINUSE — port 42100 squatted but neither us nor a fresh-build
-      // peer. Bind a random port and inject that via chat.params.
-      const server = await startServer(0);
-      debugLog.log(`[windsurf-plugin] 42100 squatted; bound random port ${server.port}`);
-      return `http://${WINDSURF_PROXY_HOST}:${server.port}/v1`;
+    // Always bind a random ephemeral port. No fixed-port adoption — that
+    // pattern made us race-bind-able by hostile local processes. The actual
+    // port is communicated to opencode via the chat.params hook below.
+    const server = await startServer(0);
+    if (debugLog.enabled) {
+      debugLog.log(`[windsurf-plugin] proxy listening on http://${WINDSURF_PROXY_HOST}:${server.port}/v1 (secret-gated)`);
     }
+    return `http://${WINDSURF_PROXY_HOST}:${server.port}/v1`;
   })();
 
-  globals[key] = { baseURL: '', startup };
+  slotRegistry[key] = { baseURL: '', startup };
   try {
     const baseURL = await startup;
-    globals[key] = { baseURL };
+    slotRegistry[key] = { baseURL };
     return baseURL;
   } catch (err) {
-    delete globals[key];
+    delete slotRegistry[key];
     throw err;
   }
 }
@@ -983,12 +1193,17 @@ export const createWindsurfPlugin =
           return;
         }
 
-        // Inject the proxy server URL dynamically. `output.options` is typed
+        // Inject the proxy server URL + the per-process Bearer secret.
+        // opencode's @ai-sdk/openai-compatible adapter forwards
+        // `options.apiKey` as `Authorization: Bearer <key>`, which is
+        // exactly the shape our proxy's authorizeProxyRequest expects.
+        // Anyone else attempting to hit 127.0.0.1:<port> without the
+        // secret gets a 401. `output.options` is typed
         // `Record<string, any>` on the Hooks side, but we only ever set two
         // string fields — keep the writes narrow.
         output.options = output.options || {};
         output.options.baseURL = proxyBaseURL;
-        output.options.apiKey = output.options.apiKey || 'windsurf-local';
+        output.options.apiKey = PROXY_SECRET;
       },
     };
     // `client` is available for future direct auth.set/get operations.

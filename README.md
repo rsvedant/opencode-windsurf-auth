@@ -62,7 +62,12 @@ npx opencode-windsurf-auth whoami          # print name + apiServerUrl
 npx opencode-windsurf-auth logout          # delete credentials
 ```
 
-Credentials live at `~/.config/opencode-windsurf-auth/credentials.json` (mode `0600`). `opencode auth logout windsurf` also clears them on next plugin load.
+Credentials live at the XDG-config location (mode `0600`):
+- Linux: `~/.config/opencode-windsurf-auth/credentials.json`
+- macOS: `~/Library/Application Support/opencode-windsurf-auth/credentials.json` (XDG → Cocoa-style path)
+- Windows: `%APPDATA%\opencode-windsurf-auth\credentials.json`
+
+`opencode auth logout windsurf` also clears them on the next plugin load.
 
 ## Opencode Configuration
 
