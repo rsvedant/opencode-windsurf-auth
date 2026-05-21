@@ -151,7 +151,15 @@ export async function prepareLogin(opts: LoginOptions = {}): Promise<PreparedLog
   // By starting the waiter promise here we ensure a matching waiter is
   // queued before any HTTP request can land. awaitToken just awaits the
   // already-running promise.
+  //
+  // Attach a `.catch` so that if the caller (opencode's `authorize()`
+  // flow) prints the URL and then NEITHER calls `awaitToken()` NOR
+  // `cancel()`, the unhandled rejection from the eventual timeout
+  // doesn't surface as a process warning. Errors are still propagated
+  // to `awaitToken`'s await — the no-op handler only runs when nobody's
+  // listening.
   const callbackPromise = server.callback(state);
+  callbackPromise.catch(() => { /* handled by awaitToken if called */ });
 
   // Open the system browser pointed at the sign-in URL. We do this in
   // prepareLogin (not awaitToken) because opencode invokes authorize()
@@ -177,11 +185,23 @@ export async function prepareLogin(opts: LoginOptions = {}): Promise<PreparedLog
   openBrowser(url).catch(() => { /* swallow — fallback URL is shown */ });
 
   let closed = false;
-  const cancel = () => {
+  const cancel = (): void => {
     if (closed) return;
     closed = true;
+    if (idleAutoCloseTimer) clearTimeout(idleAutoCloseTimer);
     try { server.close(); } catch { /* ok */ }
   };
+
+  // Auto-cancel if neither `awaitToken` nor `cancel` is invoked within
+  // 2× timeoutMs. This catches the case where opencode (or a 3rd-party
+  // consumer) prints the URL but then never polls — the loopback server
+  // would otherwise stay bound until process exit. The hard timeout
+  // matches the OAuth flow's own upper bound + headroom.
+  const idleAutoCloseTimer = setTimeout(() => {
+    if (closed) return;
+    cancel();
+  }, timeoutMs * 2);
+  if (typeof idleAutoCloseTimer.unref === 'function') idleAutoCloseTimer.unref();
 
   return {
     url,
@@ -280,7 +300,13 @@ async function loginWithLoopback(
     const callbackPromise = server.callback(state);
 
     await opts.onUrl?.(loginUrl);
-    await openBrowser(loginUrl);
+    // Don't `await` directly — if openBrowser rejects (headless SSH host
+    // with no `xdg-open` / `open`, sandbox without GUI, etc.) we still
+    // want to fall through to waitWithTimeout so the user can manually
+    // click the URL we already emitted via `onUrl`. Previously the
+    // unawaited rejection would crash login() before the callback could
+    // arrive.
+    await openBrowser(loginUrl).catch(() => { /* manual click fallback */ });
 
     const callback = await waitWithTimeout(
       callbackPromise,

@@ -28,6 +28,31 @@ import { buildMetadata } from './metadata.js';
 
 const DEFAULT_HOST = 'https://server.codeium.com';
 
+/**
+ * Polyfill for `AbortSignal.any` — composes multiple signals so the result
+ * aborts when ANY input aborts. Built-in in Node ≥20.3 / Bun ≥1.0. Our
+ * `engines.node` is `>=18.0.0`, so we ship the fallback ourselves; without
+ * it the caller's cancel signal silently disappears on older runtimes
+ * (chat-cancel during a `GetUserJwt` mint would keep the network request
+ * alive for up to the full 30s timeout).
+ */
+function anySignal(signals: AbortSignal[]): AbortSignal {
+  const builtin = (AbortSignal as unknown as { any?: (s: AbortSignal[]) => AbortSignal }).any;
+  if (typeof builtin === 'function') return builtin(signals);
+  const controller = new AbortController();
+  const onAbort = (reason: unknown): void => {
+    if (!controller.signal.aborted) controller.abort(reason);
+  };
+  for (const s of signals) {
+    if (s.aborted) {
+      onAbort(s.reason);
+      break;
+    }
+    s.addEventListener('abort', () => onAbort(s.reason), { once: true });
+  }
+  return controller.signal;
+}
+
 export interface MintedUserJwt {
   jwt: string;
   /** Unix epoch seconds when the JWT expires. */
@@ -71,17 +96,16 @@ export async function mintUserJwt(
   // GetUserJwtRequest { metadata: Metadata }   — Metadata is field 1
   const req = encodeMessage(1, metadata);
 
-  // Compose caller signal with our internal timeout. AbortSignal.any was
-  // added in Node 20 / Bun ≥1.0; for older runtimes we fall back to the
-  // timeout-only signal.
+  // Compose caller signal with our internal timeout via `anySignal` — a
+  // small polyfill of `AbortSignal.any` for runtimes (Node 18 / older
+  // Bun) that lack the built-in. The previous fallback silently dropped
+  // the CALLER's signal on those runtimes, so a chat-cancel during a
+  // GetUserJwt mint would keep the network request alive for up to the
+  // full 30s timeout.
   const timeoutSignal = AbortSignal.timeout(MINT_TIMEOUT_MS);
-  let combinedSignal: AbortSignal = timeoutSignal;
-  if (signal) {
-    const anyFn = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
-    if (typeof anyFn === 'function') {
-      combinedSignal = anyFn([signal, timeoutSignal]);
-    }
-  }
+  const combinedSignal: AbortSignal = signal
+    ? anySignal([signal, timeoutSignal])
+    : timeoutSignal;
 
   const resp = await fetch(`${host.replace(/\/$/, '')}/exa.auth_pb.AuthService/GetUserJwt`, {
     method: 'POST',
