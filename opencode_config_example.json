@@ -1,10 +1,11 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "opencode-windsurf-auth"
+    "opencode-windsurf-auth@beta"
   ],
   "provider": {
     "windsurf": {
+      "name": "Cognition (Windsurf)",
       "npm": "@ai-sdk/openai-compatible",
       "options": {
         "baseURL": "http://127.0.0.1:42100/v1"

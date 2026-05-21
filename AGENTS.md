@@ -6,7 +6,7 @@ Guidance for AI agents working with this repository.
 
 This is an **OpenCode plugin** that enables authentication with Windsurf/Codeium's local language server. It allows access to 90+ models including `swe-1.5`, `claude-4.5-sonnet`, `gpt-5`, and others available through Windsurf.
 
-**Key insight**: Windsurf does NOT use REST APIs or cloud OAuth - it uses **local gRPC** to communicate with a language server process that runs when Windsurf is open.
+**Key insight**: Windsurf's Cascade chat uses **local gRPC** to communicate with a `language_server` child process. As of 0.3, the plugin can drive that child itself instead of scraping a running Windsurf app — see [docs/OAUTH.md](docs/OAUTH.md). Cascade RPCs are NOT exposed on `server.codeium.com` (confirmed via curl probes — every `/exa.language_server_pb.LanguageServerService/*` returns 404 there), so the local language_server stays mandatory; we just spawn it ourselves with OAuth-issued credentials.
 
 ## Build & Test
 
@@ -22,12 +22,23 @@ bun test         # Run tests
 ```
 src/
 ├── plugin.ts              # Main entry, OpenAI-compatible fetch handler
+├── cli.ts                 # `opencode-windsurf-auth` CLI: login/logout/whoami/status
 ├── constants.ts           # Plugin ID, gRPC service names
+├── oauth/                 # NEW (0.3) — browser-based OAuth login flow
+│   ├── login.ts           # Loopback callback + manual-paste strategies
+│   ├── register-user.ts   # POST register.windsurf.com → {apiKey, name, apiServerUrl}
+│   ├── storage.ts         # ~/.config/opencode-windsurf-auth/credentials.json (mode 0600)
+│   └── types.ts           # Region defaults, persisted-credentials shape
 └── plugin/
-    ├── auth.ts            # Credential discovery from process args
-    ├── grpc-client.ts     # HTTP/2 gRPC client with manual protobuf encoding
-    ├── models.ts          # Model name → enum mappings (90+ models)
-    └── types.ts           # TypeScript types, ModelEnum values
+    ├── auth.ts                       # Legacy scrape-from-running-Windsurf path (still used as fallback)
+    ├── credentials-resolver.ts       # NEW — picks OAuth vs legacy, glues to spawner
+    ├── language-server-spawner.ts    # NEW — spawns our own language_server child
+    ├── cascade-client.ts             # Cascade RPC flow (unchanged)
+    ├── grpc-client.ts                # HTTP/2 gRPC + manual protobuf encoding
+    ├── discovery.ts                  # Reads Metadata field numbers from extension.js
+    ├── protobuf.ts                   # Shared varint/string helpers
+    ├── models.ts                     # Model name → enum mappings (94 models)
+    └── types.ts                      # TypeScript types, ModelEnum values
 ```
 
 ## Key Design Patterns
@@ -156,6 +167,7 @@ grep -oE '[A-Z0-9_]+\s*=\s*[0-9]+' extension.js | grep -E 'CLAUDE|GPT|GEMINI|DEE
 ## Documentation
 
 - [README.md](README.md) - Installation & usage
+- [docs/OAUTH.md](docs/OAUTH.md) - **Read this if you're touching auth.** Full browser-OAuth flow (Auth0 client id, redirect_uri modes), the `RegisterUser` cloud RPC, tenant-specific `apiServerUrl`, spawning our own `language_server` (parent-pipe keep-alive, CSRF env var, stdin metadata), and concrete reasons cloud-bypass is impossible.
 - [docs/CASCADE_PROTOCOL.md](docs/CASCADE_PROTOCOL.md) - **Read this first if you're touching the wire format.** Windsurf 2.x Cascade-flow gotchas: session gate, string-UID models, metadata field requirements, transcript parsing, `.pb` cleanup, etc. All non-obvious findings live here.
 - [docs/WINDSURF_API_SPEC.md](docs/WINDSURF_API_SPEC.md) - API reference (wire format still accurate; the `RawGetChatMessage` flow it describes is dead — see CASCADE_PROTOCOL.md)
 - [docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md) - How the original gRPC approach was discovered
