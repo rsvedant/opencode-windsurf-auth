@@ -11,8 +11,6 @@
  * docs/CLOUD_DIRECT.md → "The exact captured request body (annotated)".
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
 import {
   encodeMessage,
   encodeString,
@@ -21,29 +19,15 @@ import {
 } from './wire.js';
 
 /**
- * Read the shipped package version once, at module load. Used as the default
- * extension_version + ide_version metadata fields. Previously hardcoded as
- * "2.0.0"; pulling from package.json means the cloud-side rate-limit /
- * deprecation gates see the actual client version we shipped, and a future
- * server-side check on minimum-supported-client won't silently lock out
- * older plugin installs.
+ * extension_version + ide_version sent to the cloud. MUST be a string the
+ * cloud recognizes as a real Windsurf release — Cognition's API silently
+ * rejects unknown version strings with `failed_precondition: "an internal
+ * error occurred"`. We previously tried pulling our package.json version
+ * (e.g. "0.3.0") and the cloud rejected every request. Stays pinned to a
+ * known-good "2.0.0" until/unless someone explicitly overrides via
+ * `MetadataInput.windsurfVersion`.
  */
-const PKG_VERSION: string = (() => {
-  // Probe two locations: src/cloud-direct/../../package.json (dev) and
-  // dist/cloud-direct/../../package.json (published). The second join is
-  // because tsc collapses src/ → dist/ but keeps the relative cloud-direct
-  // path, so both end up resolving the same package.json.
-  for (const p of [
-    path.join(__dirname, '..', '..', 'package.json'),
-    path.join(__dirname, '..', '..', '..', 'package.json'),
-  ]) {
-    try {
-      const pkg = JSON.parse(fs.readFileSync(p, 'utf8')) as { version?: string };
-      if (typeof pkg.version === 'string') return pkg.version;
-    } catch { /* try next */ }
-  }
-  return '2.0.0';
-})();
+const WINDSURF_VERSION_STRING = '2.0.0';
 
 export interface MetadataInput {
   /** Persistent api_key from OAuth (`devin-session-token$<JWT>`). */
@@ -72,7 +56,7 @@ function osString(): string {
 }
 
 export function buildMetadata(input: MetadataInput): Buffer {
-  const version = input.windsurfVersion ?? PKG_VERSION;
+  const version = input.windsurfVersion ?? WINDSURF_VERSION_STRING;
   const os = input.osName ?? osString();
   const parts: Buffer[] = [
     encodeString(1, 'windsurf'),                     // ide_name

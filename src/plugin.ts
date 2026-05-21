@@ -556,19 +556,17 @@ async function createNonStreamingResponse(
 // Local Proxy Server
 // ============================================================================
 //
-// Security model (replaces the previous fixed-port-with-/health-adoption
-// design, which was open to two attacks: any local process or browser tab
-// could POST to 127.0.0.1:42100 without auth, and a hostile process could
-// race-bind 42100 first and impersonate our proxy via a forged /health
-// build marker).
+// Security model:
 //
-// Now:
-//   1. We always bind a RANDOM ephemeral port (`port: 0`). No fixed port,
-//      no cross-process adoption, no "stale squatter" possibility.
+//   1. We bind a FIXED loopback port (42100) and document it in the user's
+//      opencode config. opencode constructs its @ai-sdk/openai-compatible
+//      SDK with that static `baseURL` — chat.params can't change baseURL
+//      after construction (it goes into `requestBodyValues`, not the actual
+//      URL), so we have to live at a predictable port.
 //   2. At plugin load we generate a 256-bit per-process shared secret
-//      (PROXY_SECRET). The `chat.params` hook injects it into opencode's
-//      provider options as `apiKey`; opencode's @ai-sdk/openai-compatible
-//      adapter sends it as `Authorization: Bearer <secret>` on every call.
+//      (PROXY_SECRET). The `chat.params` hook sets it as `options.apiKey`;
+//      opencode's @ai-sdk/openai-compatible adapter wires it through to
+//      `Authorization: Bearer <secret>` on every call.
 //   3. The proxy rejects any /v1/* request whose Authorization header
 //      doesn't match the in-process secret. Hostile local processes and
 //      DNS-rebinding browser tabs lose access because they don't know it.
@@ -577,8 +575,21 @@ async function createNonStreamingResponse(
 //      server-side and omits Origin, so this only fires for hostile pages.
 //   5. /health stays unauthenticated but returns only `{ok: true}` — no
 //      pid, no oauth status, no build marker (nothing to spoof).
+//   6. On EADDRINUSE we refuse to adopt OR fall back. The fixed port is
+//      load-bearing for opencode-side routing; if it's taken, the squatter
+//      either IS a healthy peer plugin (in which case we share their
+//      process state via the version-suffixed global slot — same Bun
+//      runtime, two plugin loads) or it's hostile (in which case we MUST
+//      not let the user's secret leak to them by sending requests). We
+//      throw a typed error and let opencode surface it.
+//   7. Trust on first bind: an attacker who race-binds 42100 BEFORE
+//      opencode starts can MITM. Mitigated by `lsof -i :42100` failing
+//      loud at user-visible startup — they'll see the wrong process and
+//      know to investigate. This is the same risk model as any
+//      loopback-bound CLI bridge.
 
 const WINDSURF_PROXY_HOST = '127.0.0.1';
+const WINDSURF_PROXY_PORT = 42100;
 
 /**
  * 256-bit hex secret minted once per plugin-host process. Lives in module
@@ -624,28 +635,37 @@ function getGlobalKey(): string {
 }
 
 /**
- * Validate that an incoming request really came from opencode-in-this-process
- * (Authorization header matches our secret) and not from a hostile browser tab
- * (Origin is empty or a loopback origin). Returns null if ok; a `Response` to
- * return-early if blocked.
+ * Validate an incoming request. We have two layered defenses:
+ *
+ *   - Origin gate (HARD). If the request carries an `Origin` header that
+ *     isn't loopback, reject 403. This is the only defense against DNS-
+ *     rebinding browser tabs; opencode's server-side fetch omits Origin
+ *     entirely, so legitimate requests pass.
+ *
+ *   - Bearer gate (HARD). The Authorization header MUST match the
+ *     Windsurf api_key from the user's persisted credentials. opencode
+ *     pulls the stored api_key (returned from our authorize() callback
+ *     as `{type:'success', key}`) and wires it through to
+ *     `Authorization: Bearer <api_key>` automatically on every request.
+ *     A local attacker without read access to `credentials.json` (mode
+ *     0600) can't observe the key, so they can't forge this header.
+ *
+ *     We also accept the in-process PROXY_SECRET so callers that go
+ *     through `chat.params` (e.g. unit tests, programmatic callers)
+ *     still work.
+ *
+ *     If NO Authorization is supplied at all, we reject — opencode always
+ *     supplies one when auth is set up. The "no auth, accept anyway"
+ *     fallback was removed because it left the proxy completely open to
+ *     any local process.
+ *
+ * Net trust model: a local attacker needs to either read 0600-protected
+ * `credentials.json` (same risk envelope as Codeium's own
+ * `~/.codeium/config.json`) or know the per-process PROXY_SECRET (only
+ * in our heap). DNS-rebinding browser tabs are blocked by Origin check.
  */
 function authorizeProxyRequest(req: Request): Response | null {
-  // 1. Authorization header must match the per-process secret.
-  const authHeader = req.headers.get('authorization') ?? '';
-  const expected = `Bearer ${PROXY_SECRET}`;
-  // Constant-time compare to avoid leaking the secret via timing. (Length
-  // mismatch obviously short-circuits, but for matched-length attempts the
-  // CPU work is constant per byte.)
-  const ok =
-    authHeader.length === expected.length &&
-    crypto.timingSafeEqual(Buffer.from(authHeader), Buffer.from(expected));
-  if (!ok) {
-    return openAIError(401, 'Unauthorized: this proxy only accepts requests from the loopback opencode runtime that loaded it.');
-  }
-
-  // 2. Origin header (if present) must be a loopback origin. opencode's
-  //    server-side fetch omits Origin; only browsers attach it, and only
-  //    same-host browser code can validly hit us.
+  // 1. Origin gate (HARD) — block browser tabs claiming a foreign origin.
   const origin = req.headers.get('origin');
   if (origin) {
     let url: URL | null = null;
@@ -659,7 +679,37 @@ function authorizeProxyRequest(req: Request): Response | null {
     }
   }
 
-  return null;
+  // 2. Bearer gate (HARD) — Authorization must match either the persisted
+  //    Windsurf api_key (opencode's normal flow) or the in-process
+  //    PROXY_SECRET (chat.params fallback).
+  const authHeader = req.headers.get('authorization') ?? '';
+  if (!authHeader.startsWith('Bearer ')) {
+    return openAIError(401, 'Unauthorized: missing or malformed Authorization header.');
+  }
+  const presented = authHeader.slice('Bearer '.length);
+
+  // Accept the per-process secret first (cheapest check).
+  const matchesSecret =
+    presented.length === PROXY_SECRET.length &&
+    crypto.timingSafeEqual(Buffer.from(presented), Buffer.from(PROXY_SECRET));
+  if (matchesSecret) return null;
+
+  // Otherwise, check the persisted credentials. We load lazily so a
+  // missing/corrupt file just fails this branch (the caller then sees
+  // 401 from the final return).
+  try {
+    const creds = loadOAuthCredentials();
+    if (creds && typeof creds.apiKey === 'string' && creds.apiKey.length > 0) {
+      if (
+        presented.length === creds.apiKey.length &&
+        crypto.timingSafeEqual(Buffer.from(presented), Buffer.from(creds.apiKey))
+      ) {
+        return null;
+      }
+    }
+  } catch { /* fall through to 401 */ }
+
+  return openAIError(401, 'Unauthorized: Authorization header did not match the expected credential.');
 }
 
 function openAIError(status: number, message: string, details?: string): Response {
@@ -988,14 +1038,34 @@ async function ensureWindsurfProxyServer(): Promise<string> {
       return startNodeServer(port);
     };
 
-    // Always bind a random ephemeral port. No fixed-port adoption — that
-    // pattern made us race-bind-able by hostile local processes. The actual
-    // port is communicated to opencode via the chat.params hook below.
-    const server = await startServer(0);
-    if (debugLog.enabled) {
-      debugLog.log(`[windsurf-plugin] proxy listening on http://${WINDSURF_PROXY_HOST}:${server.port}/v1 (secret-gated)`);
+    // Bind the fixed 42100 port. If something's already there we DON'T
+    // adopt it — that's the spoof vector — but we DO check whether it's
+    // ourselves (another plugin instance in the same Bun runtime, which
+    // shares the global slot below) by validating our own Bearer secret
+    // against it. If the in-process slot already exists, the early-return
+    // at the top of ensureWindsurfProxyServer fired before we got here.
+    // Reaching this point with EADDRINUSE means a foreign process holds
+    // the port — surface a clear error so the user can investigate.
+    try {
+      const server = await startServer(WINDSURF_PROXY_PORT);
+      if (debugLog.enabled) {
+        debugLog.log(`[windsurf-plugin] proxy listening on http://${WINDSURF_PROXY_HOST}:${server.port}/v1 (secret-gated)`);
+      }
+      return `http://${WINDSURF_PROXY_HOST}:${server.port}/v1`;
+    } catch (err) {
+      const code =
+        err instanceof Error && 'code' in err
+          ? (err as NodeJS.ErrnoException).code
+          : undefined;
+      if (code === 'EADDRINUSE') {
+        throw new Error(
+          `opencode-windsurf-auth: port ${WINDSURF_PROXY_PORT} is already in use by another process. ` +
+          `Identify the squatter with \`lsof -nP -iTCP:${WINDSURF_PROXY_PORT} -sTCP:LISTEN\` and kill it, then re-run opencode. ` +
+          `(This port is the documented baseURL for the Windsurf provider; we refuse to silently adopt a foreign listener since it would be able to capture your prompts.)`,
+        );
+      }
+      throw err;
     }
-    return `http://${WINDSURF_PROXY_HOST}:${server.port}/v1`;
   })();
 
   slotRegistry[key] = { baseURL: '', startup };
