@@ -153,4 +153,4 @@ bun test
 
 ## License
 
-MIT
+[MIT](LICENSE)
