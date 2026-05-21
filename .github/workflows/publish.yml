@@ -93,17 +93,11 @@ jobs:
           echo "version=${PKG_VERSION}" >> "${GITHUB_OUTPUT}"
           echo "Resolved version: ${PKG_VERSION}"
 
-      - name: Warn if version is already published
+      - name: Refuse to publish a version that already exists
         if: ${{ inputs.dry_run != true }}
-        # `continue-on-error: true` so re-tagging an already-published
-        # version (e.g. to refresh dist-tags after a workflow change) is
-        # a supported scenario: this step reports the conflict, the
-        # publish step below also reports failure, and the dist-tag
-        # step still runs to refresh `latest`/`beta`.
-        continue-on-error: true
         run: |
           if npm view "opencode-windsurf-auth@${{ steps.version.outputs.version }}" version >/dev/null 2>&1; then
-            echo "::warning::opencode-windsurf-auth@${{ steps.version.outputs.version }} is already on npm. The publish step below will fail; the dist-tag step will still run to refresh `latest`/`beta`."
+            echo "::error::opencode-windsurf-auth@${{ steps.version.outputs.version }} is already published. Bump package.json and re-tag."
             exit 1
           fi
 
@@ -121,12 +115,6 @@ jobs:
         # `npm publish --tag beta` atomically sets the `beta` dist-tag using
         # the OIDC-authenticated Trusted Publisher token. No long-lived
         # secret needed for this step.
-        #
-        # `continue-on-error: true` so re-tagging an already-published
-        # version still proceeds to the dist-tag step — npm publish
-        # fails with EVERSION but that's expected. For fresh versions
-        # this is a no-op.
-        continue-on-error: true
         run: npm publish --provenance --access public --tag beta
 
       - name: Also point `latest` at this version
