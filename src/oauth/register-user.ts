@@ -66,6 +66,18 @@ export async function registerUser(
   }
 
   const url = `${region.registerApiServerUrl.replace(/\/$/, '')}/exa.seat_management_pb.SeatManagementService/RegisterUser`;
+
+  // 30s internal timeout — RegisterUser responds in ~200ms in steady state.
+  // CLI users on flaky networks need bounded waits or the sign-in command
+  // hangs forever. Compose with caller signal via AbortSignal.any when
+  // available.
+  const timeoutSignal = AbortSignal.timeout(30_000);
+  let combinedSignal: AbortSignal = timeoutSignal;
+  if (abortSignal) {
+    const anyFn = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+    combinedSignal = typeof anyFn === 'function' ? anyFn([abortSignal, timeoutSignal]) : abortSignal;
+  }
+
   const response = await fetch(url, {
     method: 'POST',
     headers: {
@@ -76,7 +88,7 @@ export async function registerUser(
       'Connect-Protocol-Version': '1',
     },
     body: JSON.stringify({ firebase_id_token: firebaseIdToken }),
-    signal: abortSignal,
+    signal: combinedSignal,
   });
 
   const text = await response.text();

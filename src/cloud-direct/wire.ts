@@ -102,15 +102,24 @@ export function* iterFields(buf: Buffer): Generator<ProtoField> {
       i = bi;
       yield { num, wire, value: v };
     } else if (wire === 1) {
+      // Bounds-check: a truncated frame mustn't yield a short fixed64 slice
+      // that downstream readers treat as a full 8-byte value. Stop iterating
+      // cleanly instead.
+      if (i + 8 > buf.length) return;
       yield { num, wire, value: buf.slice(i, i + 8) };
       i += 8;
     } else if (wire === 2) {
       const [n, ci] = decodeVarint(buf, i);
       i = ci;
       const len = Number(n);
+      // Bounds-check: when the declared length runs past the buffer, the
+      // frame is corrupt or truncated. Returning short-buffered slices to
+      // downstream parsers used to misparse silently (M12).
+      if (len < 0 || i + len > buf.length) return;
       yield { num, wire, value: buf.slice(i, i + len) };
       i += len;
     } else if (wire === 5) {
+      if (i + 4 > buf.length) return;
       yield { num, wire, value: buf.slice(i, i + 4) };
       i += 4;
     } else if (wire === 3 || wire === 4) {
@@ -170,11 +179,10 @@ export function parseConnectFrames(buf: Buffer): ConnectFrame[] {
     if (i + 5 + len > buf.length) break;
     let payload = buf.slice(i + 5, i + 5 + len);
     if (flags & 0x01) {
-      try {
-        payload = zlib.gunzipSync(payload);
-      } catch {
-        /* keep raw if gunzip fails — server sometimes labels uncompressed frames */
-      }
+      // Compressed frame. If gunzip fails the frame is genuinely corrupt
+      // — surfacing as a thrown error beats parsing raw gzip bytes as proto
+      // (which previously produced misleading "yielded bad wire type" downstream).
+      payload = zlib.gunzipSync(payload);
     }
     out.push({ flags, payload, eos: (flags & 0x02) !== 0 });
     i += 5 + len;

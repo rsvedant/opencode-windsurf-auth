@@ -23,7 +23,7 @@
  */
 
 import * as crypto from 'crypto';
-import { encodeMessage } from './wire.js';
+import { encodeMessage, iterFields } from './wire.js';
 import { buildMetadata } from './metadata.js';
 
 const DEFAULT_HOST = 'https://server.codeium.com';
@@ -42,11 +42,26 @@ export class CloudAuthError extends Error {
 }
 
 /**
+ * Default mint timeout — 30s is generous (the endpoint responds in ~200ms
+ * in steady state) but enough headroom for slow networks. Callers can pass
+ * a tighter `signal` to override.
+ */
+const MINT_TIMEOUT_MS = 30_000;
+
+/**
  * Mint a fresh user_jwt by calling exa.auth_pb.AuthService/GetUserJwt.
  * `host` defaults to https://server.codeium.com — pass your tenant URL if your
  * RegisterUser response gave a different host.
+ *
+ * Always applies an internal 30s timeout so a network stall here can't
+ * deadlock every concurrent chat request. If the caller passes a `signal`,
+ * we honor whichever fires first via AbortSignal.any.
  */
-export async function mintUserJwt(apiKey: string, host: string = DEFAULT_HOST): Promise<MintedUserJwt> {
+export async function mintUserJwt(
+  apiKey: string,
+  host: string = DEFAULT_HOST,
+  signal?: AbortSignal,
+): Promise<MintedUserJwt> {
   const metadata = buildMetadata({
     apiKey,
     sessionId: crypto.randomUUID(),
@@ -56,6 +71,18 @@ export async function mintUserJwt(apiKey: string, host: string = DEFAULT_HOST): 
   // GetUserJwtRequest { metadata: Metadata }   — Metadata is field 1
   const req = encodeMessage(1, metadata);
 
+  // Compose caller signal with our internal timeout. AbortSignal.any was
+  // added in Node 20 / Bun ≥1.0; for older runtimes we fall back to the
+  // timeout-only signal.
+  const timeoutSignal = AbortSignal.timeout(MINT_TIMEOUT_MS);
+  let combinedSignal: AbortSignal = timeoutSignal;
+  if (signal) {
+    const anyFn = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+    if (typeof anyFn === 'function') {
+      combinedSignal = anyFn([signal, timeoutSignal]);
+    }
+  }
+
   const resp = await fetch(`${host.replace(/\/$/, '')}/exa.auth_pb.AuthService/GetUserJwt`, {
     method: 'POST',
     headers: {
@@ -63,6 +90,7 @@ export async function mintUserJwt(apiKey: string, host: string = DEFAULT_HOST): 
       'Connect-Protocol-Version': '1',
     },
     body: req,
+    signal: combinedSignal,
   });
   const buf = Buffer.from(await resp.arrayBuffer());
 
@@ -71,14 +99,30 @@ export async function mintUserJwt(apiKey: string, host: string = DEFAULT_HOST): 
     throw new CloudAuthError(`GetUserJwt HTTP ${resp.status}: ${text.slice(0, 400)}`, resp.status);
   }
 
-  // Response is GetUserJwtResponse { user_jwt: string }. Rather than write a
-  // full proto reader for one field, just regex out the JWT-shaped substring.
-  // A devin user_jwt is HS256-signed and well-formed (`eyJhbGc...`).
-  const m = buf.toString('binary').match(/eyJ[A-Za-z0-9_-]{20,2000}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
-  if (!m) {
-    throw new CloudAuthError(`GetUserJwt 200 but no JWT in response (${buf.length} bytes): ${buf.toString('utf8').slice(0, 200)}`);
+  // Response is GetUserJwtResponse { user_jwt: string } where user_jwt is
+  // field 1, length-delimited. Decode the field properly instead of
+  // regex-scanning the whole buffer — the previous regex would pick up
+  // any JWT-shaped substring in the response (trace IDs, signature
+  // headers, any cached token inadvertently logged) and could even land
+  // on a non-user_jwt if Cognition ever embeds another JWT in a sibling
+  // field.
+  let jwt: string | null = null;
+  for (const f of iterFields(buf)) {
+    if (f.num === 1 && f.wire === 2 && Buffer.isBuffer(f.value)) {
+      const s = (f.value as Buffer).toString('utf8');
+      // Sanity-check the shape — defensive: if the cloud ever moves user_jwt
+      // out from field 1 we want a clean error, not silently wrong creds.
+      if (/^eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(s)) {
+        jwt = s;
+        break;
+      }
+    }
   }
-  const jwt = m[0];
+  if (!jwt) {
+    throw new CloudAuthError(
+      `GetUserJwt 200 but no field-1 JWT found (${buf.length} bytes): ${buf.toString('utf8').slice(0, 200)}`,
+    );
+  }
 
   // Decode the payload to get the expiry.
   let expiresAt = Math.floor(Date.now() / 1000) + 600;   // fallback: 10 min
@@ -105,30 +149,54 @@ interface CacheEntry {
   host: string;
 }
 
+/**
+ * Cache is keyed by (apiKey, host). A single shared `cache` slot only holds
+ * the MOST RECENTLY USED entry — common case is one account at a time, so
+ * a single slot is enough. inFlight is a per-key map so a JWT mint for
+ * account A doesn't get returned to a concurrent request for account B.
+ *
+ * Previously `inFlight` was a singleton — if account A's mint was in flight
+ * and a request for account B arrived, B got A's JWT. That's the M1
+ * "concurrent requests after account switch get wrong JWT" bug.
+ */
 let cache: CacheEntry | null = null;
-let inFlight: Promise<MintedUserJwt> | null = null;
+const inFlight = new Map<string, Promise<MintedUserJwt>>();
+
+function flightKey(apiKey: string, host: string): string {
+  return `${host}\x1f${apiKey}`;
+}
 
 /**
  * Get a cached user_jwt or mint a new one. Refreshes when the cached JWT is
- * within 60s of expiry. Multiple concurrent callers share the same in-flight
- * mint to avoid hammering the server.
+ * within 60s of expiry. Multiple concurrent callers for the SAME (apiKey, host)
+ * share the same in-flight mint; concurrent callers for DIFFERENT keys each
+ * get their own mint.
  */
-export async function getCachedUserJwt(apiKey: string, host: string = DEFAULT_HOST): Promise<string> {
+export async function getCachedUserJwt(apiKey: string, host: string = DEFAULT_HOST, signal?: AbortSignal): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   if (cache && cache.apiKey === apiKey && cache.host === host && cache.expiresAt > now + 60) {
     return cache.jwt;
   }
-  if (inFlight) return (await inFlight).jwt;
-  inFlight = mintUserJwt(apiKey, host);
+  const key = flightKey(apiKey, host);
+  const existing = inFlight.get(key);
+  if (existing) return (await existing).jwt;
+  const promise = mintUserJwt(apiKey, host, signal);
+  inFlight.set(key, promise);
   try {
-    const minted = await inFlight;
+    const minted = await promise;
     cache = { jwt: minted.jwt, expiresAt: minted.expiresAt, apiKey, host };
     return minted.jwt;
   } finally {
-    inFlight = null;
+    inFlight.delete(key);
   }
 }
 
+/**
+ * Drop the in-memory JWT cache. Call after credential changes (logout,
+ * account switch) so long-running opencode processes don't keep using a
+ * JWT minted from a now-invalid api_key.
+ */
 export function clearCachedUserJwt(): void {
   cache = null;
+  inFlight.clear();
 }
