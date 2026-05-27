@@ -273,6 +273,43 @@ function recentMessages(messages: ChatHistoryItem[], count: number): ChatHistory
   return messages.filter((m) => m.role !== 'system').slice(-count);
 }
 
+function contentToText(content: ChatHistoryItem['content']): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return String(content ?? '');
+  return content
+    .map((part) => {
+      if (!part || typeof part !== 'object') return '';
+      if ('text' in part && typeof part.text === 'string') return part.text;
+      if ('image_url' in part) return '[image]';
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function flattenToolHistoryMessages(messages: ChatHistoryItem[]): ChatHistoryItem[] {
+  return messages.map((m) => {
+    const text = contentToText(m.content);
+    if (m.role === 'tool') {
+      return {
+        role: 'user',
+        content: `<tool_result tool_call_id="${m.tool_call_id ?? ''}">\n${text}\n</tool_result>`,
+      } satisfies ChatHistoryItem;
+    }
+    if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
+      const calls = m.tool_calls
+        .map((tc) => `<assistant_tool_call id="${tc.id}" name="${tc.name}">${tc.arguments}</assistant_tool_call>`)
+        .join('\n');
+      return {
+        role: 'assistant',
+        content: text ? `${text}\n${calls}` : calls,
+      } satisfies ChatHistoryItem;
+    }
+    if (m.role === 'system') return m;
+    return { role: m.role, content: text } satisfies ChatHistoryItem;
+  });
+}
+
 function latestUserMessage(messages: ChatHistoryItem[]): ChatHistoryItem | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i]?.role === 'user') return messages[i];
@@ -296,7 +333,9 @@ function plannerDraftContext(messages: ChatHistoryItem[]): string {
 function buildToolCallTranslatorMessages(messages: ChatHistoryItem[], opusDraft: string, tailCount: number): ChatHistoryItem[] {
   const latestUser = latestUserMessage(messages);
   const tail = recentMessages(messages, tailCount);
-  const context: ChatHistoryItem[] = latestUser ? [latestUser, ...tail.filter((m) => m !== latestUser)] : tail;
+  const context: ChatHistoryItem[] = flattenToolHistoryMessages(
+    latestUser ? [latestUser, ...tail.filter((m) => m !== latestUser)] : tail,
+  );
   return [
     ...context,
     {
@@ -328,7 +367,7 @@ function buildToolResultMessages(messages: ChatHistoryItem[], config: TextOnlyTo
   const latestUser = latestUserMessage(messages);
   const tailCount = config.toolResultContext === 'minimal' ? 6 : config.toolResultContextMessages;
   const tail = recentMessages(messages, tailCount);
-  const context = latestUser ? [latestUser, ...tail.filter((m) => m !== latestUser)] : tail;
+  const context = flattenToolHistoryMessages(latestUser ? [latestUser, ...tail.filter((m) => m !== latestUser)] : tail);
   return [...context, injected];
 }
 
