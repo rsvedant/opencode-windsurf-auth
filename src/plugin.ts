@@ -119,6 +119,39 @@ type CloudToolDef = {
 };
 
 const DEFAULT_TOOL_CALL_TRANSLATOR_MODEL = 'swe-1.6';
+const DEFAULT_TOOL_INTENT_DETECTION: ToolIntentDetectionMode = 'always';
+const DEFAULT_TOOL_TRANSLATOR_CONTEXT_MESSAGES = 8;
+const DEFAULT_TOOL_RESULT_CONTEXT: ToolResultContextMode = 'tail';
+const DEFAULT_TOOL_RESULT_CONTEXT_MESSAGES = 24;
+const MAX_STORED_PLANNER_DRAFTS = 200;
+
+type ToolIntentDetectionMode = 'always' | 'assist' | 'marker';
+type ToolResultContextMode = 'full' | 'tail' | 'minimal';
+
+interface TextOnlyToolConfig {
+  toolIntentDetection: ToolIntentDetectionMode;
+  toolTranslatorContextMessages: number;
+  toolResultContext: ToolResultContextMode;
+  toolResultContextMessages: number;
+}
+
+interface PlannerDraftEntry {
+  draft: string;
+  modelUid: string;
+  createdAt: number;
+}
+
+const plannerDraftByToolCallId = new Map<string, PlannerDraftEntry>();
+
+function storePlannerDraft(toolCallId: string, entry: Omit<PlannerDraftEntry, 'createdAt'>): void {
+  if (!toolCallId || !entry.draft) return;
+  plannerDraftByToolCallId.set(toolCallId, { ...entry, createdAt: Date.now() });
+  while (plannerDraftByToolCallId.size > MAX_STORED_PLANNER_DRAFTS) {
+    const oldest = plannerDraftByToolCallId.keys().next().value;
+    if (!oldest) break;
+    plannerDraftByToolCallId.delete(oldest);
+  }
+}
 
 function extractToolCallTranslatorFromProviderOptions(providerOptions: Record<string, unknown> | undefined): string | undefined {
   if (!providerOptions) return undefined;
@@ -136,6 +169,71 @@ function extractToolCallTranslatorFromProviderOptions(providerOptions: Record<st
     pickString(providerOptions['toolFallbackModel']) ??
     pickString(providerOptions['fallbackModel'])
   );
+}
+
+function windsurfProviderOptions(providerOptions: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!providerOptions) return undefined;
+  const raw = providerOptions['windsurf'];
+  return raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : undefined;
+}
+
+function pickStringConfig(providerOptions: Record<string, unknown> | undefined, key: string): string | undefined {
+  const windsurf = windsurfProviderOptions(providerOptions);
+  const v = windsurf?.[key] ?? providerOptions?.[key];
+  return typeof v === 'string' ? v : undefined;
+}
+
+function pickNumberConfig(providerOptions: Record<string, unknown> | undefined, key: string): number | undefined {
+  const windsurf = windsurfProviderOptions(providerOptions);
+  const v = windsurf?.[key] ?? providerOptions?.[key];
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string' && v.trim() !== '') {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+function clampInt(v: number | undefined, fallback: number, min: number, max: number): number {
+  if (v === undefined || !Number.isFinite(v)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(v)));
+}
+
+function resolveToolConfig(providerOptions: Record<string, unknown> | undefined): TextOnlyToolConfig {
+  const detectionRaw =
+    pickStringConfig(providerOptions, 'toolIntentDetection') ??
+    process.env.OPENCODE_WINDSURF_TOOL_INTENT_DETECTION ??
+    DEFAULT_TOOL_INTENT_DETECTION;
+  const detection: ToolIntentDetectionMode =
+    detectionRaw === 'marker' || detectionRaw === 'assist' || detectionRaw === 'always'
+      ? detectionRaw
+      : DEFAULT_TOOL_INTENT_DETECTION;
+
+  const resultRaw =
+    pickStringConfig(providerOptions, 'toolResultContext') ??
+    process.env.OPENCODE_WINDSURF_TOOL_RESULT_CONTEXT ??
+    DEFAULT_TOOL_RESULT_CONTEXT;
+  const resultContext: ToolResultContextMode =
+    resultRaw === 'full' || resultRaw === 'tail' || resultRaw === 'minimal'
+      ? resultRaw
+      : DEFAULT_TOOL_RESULT_CONTEXT;
+
+  return {
+    toolIntentDetection: detection,
+    toolTranslatorContextMessages: clampInt(
+      pickNumberConfig(providerOptions, 'toolTranslatorContextMessages') ?? Number(process.env.OPENCODE_WINDSURF_TOOL_TRANSLATOR_CONTEXT_MESSAGES),
+      DEFAULT_TOOL_TRANSLATOR_CONTEXT_MESSAGES,
+      1,
+      64,
+    ),
+    toolResultContext: resultContext,
+    toolResultContextMessages: clampInt(
+      pickNumberConfig(providerOptions, 'toolResultContextMessages') ?? Number(process.env.OPENCODE_WINDSURF_TOOL_RESULT_CONTEXT_MESSAGES),
+      DEFAULT_TOOL_RESULT_CONTEXT_MESSAGES,
+      1,
+      128,
+    ),
+  };
 }
 
 function getToolCallTranslatorModel(providerOptions: Record<string, unknown> | undefined): ReturnType<typeof resolveModel> {
@@ -171,9 +269,36 @@ function buildOpusToolPlanningMessages(messages: ChatHistoryItem[], tools: Cloud
   ];
 }
 
-function buildToolCallTranslatorMessages(messages: ChatHistoryItem[], opusDraft: string): ChatHistoryItem[] {
+function recentMessages(messages: ChatHistoryItem[], count: number): ChatHistoryItem[] {
+  return messages.filter((m) => m.role !== 'system').slice(-count);
+}
+
+function latestUserMessage(messages: ChatHistoryItem[]): ChatHistoryItem | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === 'user') return messages[i];
+  }
+  return undefined;
+}
+
+function plannerDraftContext(messages: ChatHistoryItem[]): string {
+  const ids = new Set<string>();
+  for (const m of messages) {
+    if (m.role === 'tool' && typeof m.tool_call_id === 'string' && m.tool_call_id) ids.add(m.tool_call_id);
+  }
+  const parts: string[] = [];
+  for (const id of ids) {
+    const entry = plannerDraftByToolCallId.get(id);
+    if (entry) parts.push(`tool_call_id=${id}\n${entry.draft}`);
+  }
+  return parts.join('\n\n');
+}
+
+function buildToolCallTranslatorMessages(messages: ChatHistoryItem[], opusDraft: string, tailCount: number): ChatHistoryItem[] {
+  const latestUser = latestUserMessage(messages);
+  const tail = recentMessages(messages, tailCount);
+  const context: ChatHistoryItem[] = latestUser ? [latestUser, ...tail.filter((m) => m !== latestUser)] : tail;
   return [
-    ...messages,
+    ...context,
     {
       role: 'user',
       content:
@@ -185,6 +310,33 @@ function buildToolCallTranslatorMessages(messages: ChatHistoryItem[], opusDraft:
         `Do not answer the user. Do not add commentary.`,
     },
   ];
+}
+
+function buildToolResultMessages(messages: ChatHistoryItem[], config: TextOnlyToolConfig): ChatHistoryItem[] {
+  const draftContext = plannerDraftContext(messages);
+  if (!draftContext) return messages;
+
+  const injected: ChatHistoryItem = {
+    role: 'system',
+    content:
+      `Previous Opus planner draft(s) that led to the tool result(s) in this turn:\n` +
+      `${draftContext}\n\nUse this to interpret the tool result and continue from the original plan.`,
+  };
+
+  if (config.toolResultContext === 'full') return [...messages, injected];
+
+  const latestUser = latestUserMessage(messages);
+  const tailCount = config.toolResultContext === 'minimal' ? 6 : config.toolResultContextMessages;
+  const tail = recentMessages(messages, tailCount);
+  const context = latestUser ? [latestUser, ...tail.filter((m) => m !== latestUser)] : tail;
+  return [...context, injected];
+}
+
+function shouldCallToolTranslator(draft: string, mode: ToolIntentDetectionMode): boolean {
+  if (mode === 'always') return true;
+  if (/\bTOOL_INTENT\s*:/i.test(draft)) return true;
+  if (mode === 'marker') return false;
+  return /\b(?:I'll|I will|let me|now|next I'll|I need to)\s+(?:run|execute|read|inspect|check|edit|search|grep|build|flash|capture|write|update)\b/i.test(draft);
 }
 
 /**
@@ -299,9 +451,13 @@ function createStreamingResponse(
         let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | null = null;
         let firstChunkSent = false;
         const t0 = Date.now();
+        const toolConfig = resolveToolConfig(request.providerOptions);
         const useTranslator = !!resolved.textOnly && tools.length > 0;
         const translator = useTranslator ? getToolCallTranslatorModel(request.providerOptions) : undefined;
-        debugLog.log(`[windsurf-plugin] streamChatEvents starting (model=${resolved.modelUid}, msgs=${multimodalMessages.length}, tools=${useTranslator ? 0 : tools.length}, toolCallTranslator=${translator?.modelUid ?? 'none'})`);
+        const opusMessages = resolved.textOnly
+          ? buildToolResultMessages(multimodalMessages, toolConfig)
+          : multimodalMessages;
+        debugLog.log(`[windsurf-plugin] streamChatEvents starting (model=${resolved.modelUid}, msgs=${opusMessages.length}, tools=${useTranslator ? 0 : tools.length}, toolCallTranslator=${translator?.modelUid ?? 'none'}, intent=${toolConfig.toolIntentDetection}, resultContext=${toolConfig.toolResultContext}:${toolConfig.toolResultContextMessages})`);
         let eventCount = 0;
         let textBytes = 0;
         // Thread the caller's `max_tokens` into the proto's
@@ -335,7 +491,7 @@ function createStreamingResponse(
             yield* streamChatEvents({
               ...common,
               modelUid: resolved.modelUid,
-              messages: multimodalMessages,
+              messages: opusMessages,
               tools: tools.length > 0 ? tools : undefined,
             });
             return;
@@ -346,7 +502,7 @@ function createStreamingResponse(
           for await (const ev of streamChatEvents({
             ...common,
             modelUid: resolved.modelUid,
-            messages: buildOpusToolPlanningMessages(multimodalMessages, tools),
+            messages: buildOpusToolPlanningMessages(opusMessages, tools),
           })) {
             opusEvents.push(ev);
             if (ev.kind === 'text') opusDraft += ev.text;
@@ -354,12 +510,18 @@ function createStreamingResponse(
 
           debugLog.log(`[windsurf-plugin] opus planner draft (${opusDraft.length}B): ${opusDraft.slice(0, 500).replace(/\n/g, '\\n')}`);
 
+          if (!shouldCallToolTranslator(opusDraft, toolConfig.toolIntentDetection)) {
+            debugLog.log(`[windsurf-plugin] tool-call translator skipped by detection=${toolConfig.toolIntentDetection}`);
+            for (const ev of opusEvents) yield ev;
+            return;
+          }
+
           let fallbackSawTool = false;
           const fallbackEvents: CloudChatEvent[] = [];
           for await (const ev of streamChatEvents({
             ...common,
             modelUid: translator.modelUid,
-            messages: buildToolCallTranslatorMessages(multimodalMessages, opusDraft),
+            messages: buildToolCallTranslatorMessages(multimodalMessages, opusDraft, toolConfig.toolTranslatorContextMessages),
             tools,
           })) {
             fallbackEvents.push(ev);
@@ -369,6 +531,10 @@ function createStreamingResponse(
           if (fallbackSawTool) {
             debugLog.log(`[windsurf-plugin] tool-call translator model=${translator.modelUid} emitted tool call(s)`);
             for (const ev of fallbackEvents) {
+              if (ev.kind === 'tool_call_start') {
+                storePlannerDraft(ev.id, { draft: opusDraft, modelUid: resolved.modelUid });
+                debugLog.log(`[windsurf-plugin] stored opus planner draft for tool_call_id=${ev.id}`);
+              }
               if (ev.kind === 'text' || ev.kind === 'reasoning') continue;
               yield ev;
             }
@@ -609,8 +775,12 @@ async function createNonStreamingResponse(
   type CollectedToolCall = { id: string; name: string; args: string };
   const collectedToolCalls: CollectedToolCall[] = [];
   let currentToolCall: CollectedToolCall | null = null;
+  const toolConfig = resolveToolConfig(request.providerOptions);
   const useTranslator = !!resolved.textOnly && tools.length > 0;
   const translator = useTranslator ? getToolCallTranslatorModel(request.providerOptions) : undefined;
+  const opusMessages = resolved.textOnly
+    ? buildToolResultMessages(multimodalMessages, toolConfig)
+    : multimodalMessages;
 
   const eventSource = async function* (): AsyncGenerator<CloudChatEvent> {
     const common = {
@@ -627,7 +797,7 @@ async function createNonStreamingResponse(
       yield* streamChatEvents({
         ...common,
         modelUid: resolved.modelUid,
-        messages: multimodalMessages,
+        messages: opusMessages,
         tools: tools.length > 0 ? tools : undefined,
       });
       return;
@@ -638,10 +808,15 @@ async function createNonStreamingResponse(
     for await (const ev of streamChatEvents({
       ...common,
       modelUid: resolved.modelUid,
-      messages: buildOpusToolPlanningMessages(multimodalMessages, tools),
+      messages: buildOpusToolPlanningMessages(opusMessages, tools),
     })) {
       opusEvents.push(ev);
       if (ev.kind === 'text') opusDraft += ev.text;
+    }
+
+    if (!shouldCallToolTranslator(opusDraft, toolConfig.toolIntentDetection)) {
+      for (const ev of opusEvents) yield ev;
+      return;
     }
 
     let fallbackSawTool = false;
@@ -649,7 +824,7 @@ async function createNonStreamingResponse(
     for await (const ev of streamChatEvents({
       ...common,
       modelUid: translator.modelUid,
-      messages: buildToolCallTranslatorMessages(multimodalMessages, opusDraft),
+      messages: buildToolCallTranslatorMessages(multimodalMessages, opusDraft, toolConfig.toolTranslatorContextMessages),
       tools,
     })) {
       fallbackEvents.push(ev);
@@ -658,6 +833,9 @@ async function createNonStreamingResponse(
 
     if (fallbackSawTool) {
       for (const ev of fallbackEvents) {
+        if (ev.kind === 'tool_call_start') {
+          storePlannerDraft(ev.id, { draft: opusDraft, modelUid: resolved.modelUid });
+        }
         if (ev.kind === 'text' || ev.kind === 'reasoning') continue;
         yield ev;
       }
