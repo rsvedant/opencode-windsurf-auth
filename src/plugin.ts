@@ -69,7 +69,7 @@ const debugLog = (() => {
 import { WindsurfCredentials, WindsurfError } from './plugin/auth.js';
 import { resolveCredentials } from './plugin/credentials-resolver.js';
 import { loadCredentials as loadOAuthCredentials } from './oauth/storage.js';
-import type { ChatHistoryItem } from './cloud-direct/index.js';
+import type { ChatHistoryItem, CloudChatEvent } from './cloud-direct/index.js';
 import {
   getDefaultModel,
   getCanonicalModels,
@@ -118,38 +118,9 @@ type CloudToolDef = {
   parameters: unknown;
 };
 
-const DEFAULT_TEXT_ONLY_TOOL_FALLBACK_MODEL = 'swe-1.6';
+const DEFAULT_TOOL_CALL_TRANSLATOR_MODEL = 'swe-1.6';
 
-function routeToolsForModel(
-  resolved: ReturnType<typeof resolveModel>,
-  tools: CloudToolDef[],
-  fallbackOverride?: string,
-): { modelUid: string; tools: CloudToolDef[]; fallbackModelId?: string } {
-  if (!resolved.textOnly || tools.length === 0) {
-    return { modelUid: resolved.modelUid, tools };
-  }
-
-  const fallbackName =
-    fallbackOverride?.trim() ||
-    process.env.OPENCODE_WINDSURF_TEXT_ONLY_TOOL_FALLBACK_MODEL?.trim() ||
-    DEFAULT_TEXT_ONLY_TOOL_FALLBACK_MODEL;
-  const fallback = resolveModel(fallbackName);
-  if (fallback.textOnly) {
-    throw new Error(
-      `Model "${resolved.modelId}" cannot use tools through Cognition cloud, and fallback ` +
-      `"${fallbackName}" is also marked text-only. Set ` +
-      `OPENCODE_WINDSURF_TEXT_ONLY_TOOL_FALLBACK_MODEL to a tool-capable model like swe-1.6.`,
-    );
-  }
-
-  debugLog.log(
-    `[windsurf-plugin] model=${resolved.modelUid} is text-only in Cognition cloud; ` +
-    `routing tool-bearing turn to fallback model=${fallback.modelUid} with ${tools.length} tool definition(s)`,
-  );
-  return { modelUid: fallback.modelUid, tools, fallbackModelId: fallback.modelId };
-}
-
-function extractTextOnlyToolFallbackFromProviderOptions(providerOptions: Record<string, unknown> | undefined): string | undefined {
+function extractToolCallTranslatorFromProviderOptions(providerOptions: Record<string, unknown> | undefined): string | undefined {
   if (!providerOptions) return undefined;
   const windsurfRaw = providerOptions['windsurf'];
   const windsurf =
@@ -158,13 +129,62 @@ function extractTextOnlyToolFallbackFromProviderOptions(providerOptions: Record<
       : undefined;
   const pickString = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
   return (
-    pickString(windsurf?.['textOnlyToolFallbackModel']) ??
+    pickString(windsurf?.['toolCallTranslatorModel']) ??
     pickString(windsurf?.['toolFallbackModel']) ??
     pickString(windsurf?.['fallbackModel']) ??
-    pickString(providerOptions['textOnlyToolFallbackModel']) ??
+    pickString(providerOptions['toolCallTranslatorModel']) ??
     pickString(providerOptions['toolFallbackModel']) ??
     pickString(providerOptions['fallbackModel'])
   );
+}
+
+function getToolCallTranslatorModel(providerOptions: Record<string, unknown> | undefined): ReturnType<typeof resolveModel> {
+  const fallbackName =
+    extractToolCallTranslatorFromProviderOptions(providerOptions)?.trim() ||
+    process.env.OPENCODE_WINDSURF_TOOL_CALL_TRANSLATOR_MODEL?.trim() ||
+    DEFAULT_TOOL_CALL_TRANSLATOR_MODEL;
+  const fallback = resolveModel(fallbackName);
+  if (fallback.textOnly) {
+    throw new Error(
+      `Tool-call translator model "${fallbackName}" is marked text-only. ` +
+      `Set OPENCODE_WINDSURF_TOOL_CALL_TRANSLATOR_MODEL to a tool-capable model like swe-1.6.`,
+    );
+  }
+  return fallback;
+}
+
+function buildOpusToolPlanningMessages(messages: ChatHistoryItem[], tools: CloudToolDef[]): ChatHistoryItem[] {
+  const manifest = tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
+  return [
+    ...messages,
+    {
+      role: 'system',
+      content:
+        `Native tool schemas cannot be sent to this model, but opencode can still execute tools after your decision.\n` +
+        `You are responsible for planning the next step.\n` +
+        `If the next step needs a command, file read/edit/search, todo update, web fetch, or any tool action, describe the intended tool action plainly.\n` +
+        `Prefer: TOOL_INTENT: <tool name> <arguments/purpose>.\n` +
+        `Do not invent tool output and do not continue as if a tool already ran.\n` +
+        `If no tool is needed, answer normally.\n\n` +
+        `Available tools:\n${JSON.stringify(manifest)}`,
+    },
+  ];
+}
+
+function buildToolCallTranslatorMessages(messages: ChatHistoryItem[], opusDraft: string): ChatHistoryItem[] {
+  return [
+    ...messages,
+    {
+      role: 'user',
+      content:
+        `The requested model cannot emit native tool calls. It produced this planned next step:\n\n` +
+        `<opus_draft>\n${opusDraft}\n</opus_draft>\n\n` +
+        `Convert that planned next step into at most one native tool call.\n` +
+        `If the draft implies command execution, file read/edit/search, todo update, web fetch, or any tool action, call exactly the matching tool.\n` +
+        `If the draft is a final answer or no tool is needed, respond with exactly: NO_TOOL.\n` +
+        `Do not answer the user. Do not add commentary.`,
+    },
+  ];
 }
 
 /**
@@ -245,7 +265,6 @@ function createStreamingResponse(
   const responseId = `chatcmpl-${crypto.randomUUID()}`;
   const requestedModel = request.model || getDefaultModel();
   const variantOverride = extractVariantFromProviderOptions(request.providerOptions);
-  const textOnlyToolFallback = extractTextOnlyToolFallbackFromProviderOptions(request.providerOptions);
 
   const abort = new AbortController();
 
@@ -259,8 +278,6 @@ function createStreamingResponse(
           description: t.function?.description ?? '',
           parameters: t.function?.parameters ?? {},
         }));
-        const routed = routeToolsForModel(resolved, tools, textOnlyToolFallback);
-
         const { streamChatEvents } = await import('./cloud-direct/index.js');
         // Cloud-direct accepts the FULL @ai-sdk multimodal content shape
         // (text + image_url parts). We pass `request.messages` straight
@@ -282,7 +299,9 @@ function createStreamingResponse(
         let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | null = null;
         let firstChunkSent = false;
         const t0 = Date.now();
-        debugLog.log(`[windsurf-plugin] streamChatEvents starting (model=${routed.modelUid}, requested=${resolved.modelUid}, msgs=${multimodalMessages.length}, tools=${routed.tools.length})`);
+        const useTranslator = !!resolved.textOnly && tools.length > 0;
+        const translator = useTranslator ? getToolCallTranslatorModel(request.providerOptions) : undefined;
+        debugLog.log(`[windsurf-plugin] streamChatEvents starting (model=${resolved.modelUid}, msgs=${multimodalMessages.length}, tools=${useTranslator ? 0 : tools.length}, toolCallTranslator=${translator?.modelUid ?? 'none'})`);
         let eventCount = 0;
         let textBytes = 0;
         // Thread the caller's `max_tokens` into the proto's
@@ -303,17 +322,64 @@ function createStreamingResponse(
           typeof request.max_tokens === 'number' && request.max_tokens > 0
             ? request.max_tokens
             : 128_000;
-        for await (const ev of streamChatEvents({
-          apiKey: credentials.apiKey,
-          apiServerUrl: credentials.apiServerUrl,
-          modelUid: routed.modelUid,
-          messages: multimodalMessages,
-          tools: routed.tools.length > 0 ? routed.tools : undefined,
-          signal: abort.signal,
-          completionOpts: {
-            maxOutputTokens: requestedMaxTokens,
-          },
-        })) {
+
+        const eventSource = async function* (): AsyncGenerator<CloudChatEvent> {
+          const common = {
+            apiKey: credentials.apiKey,
+            apiServerUrl: credentials.apiServerUrl,
+            signal: abort.signal,
+            completionOpts: { maxOutputTokens: requestedMaxTokens },
+          };
+
+          if (!useTranslator || !translator) {
+            yield* streamChatEvents({
+              ...common,
+              modelUid: resolved.modelUid,
+              messages: multimodalMessages,
+              tools: tools.length > 0 ? tools : undefined,
+            });
+            return;
+          }
+
+          const opusEvents: CloudChatEvent[] = [];
+          let opusDraft = '';
+          for await (const ev of streamChatEvents({
+            ...common,
+            modelUid: resolved.modelUid,
+            messages: buildOpusToolPlanningMessages(multimodalMessages, tools),
+          })) {
+            opusEvents.push(ev);
+            if (ev.kind === 'text') opusDraft += ev.text;
+          }
+
+          debugLog.log(`[windsurf-plugin] opus planner draft (${opusDraft.length}B): ${opusDraft.slice(0, 500).replace(/\n/g, '\\n')}`);
+
+          let fallbackSawTool = false;
+          const fallbackEvents: CloudChatEvent[] = [];
+          for await (const ev of streamChatEvents({
+            ...common,
+            modelUid: translator.modelUid,
+            messages: buildToolCallTranslatorMessages(multimodalMessages, opusDraft),
+            tools,
+          })) {
+            fallbackEvents.push(ev);
+            if (ev.kind === 'tool_call_start') fallbackSawTool = true;
+          }
+
+          if (fallbackSawTool) {
+            debugLog.log(`[windsurf-plugin] tool-call translator model=${translator.modelUid} emitted tool call(s)`);
+            for (const ev of fallbackEvents) {
+              if (ev.kind === 'text' || ev.kind === 'reasoning') continue;
+              yield ev;
+            }
+            return;
+          }
+
+          debugLog.log(`[windsurf-plugin] tool-call translator model=${translator.modelUid} emitted no tool call; streaming opus draft`);
+          for (const ev of opusEvents) yield ev;
+        };
+
+        for await (const ev of eventSource()) {
           eventCount++;
           if (eventCount === 1) debugLog.log(`[windsurf-plugin] streamChatEvents first event after ${Date.now() - t0}ms (kind=${ev.kind})`);
           // @ai-sdk expects `delta.role: 'assistant'` on the *first* chunk
@@ -516,7 +582,6 @@ async function createNonStreamingResponse(
   const responseId = `chatcmpl-${crypto.randomUUID()}`;
   const requestedModel = request.model || getDefaultModel();
   const variantOverride = extractVariantFromProviderOptions(request.providerOptions);
-  const textOnlyToolFallback = extractTextOnlyToolFallbackFromProviderOptions(request.providerOptions);
   const resolved = resolveModel(requestedModel, variantOverride);
 
   const tools = (request.tools ?? []).map((t) => ({
@@ -524,8 +589,6 @@ async function createNonStreamingResponse(
     description: t.function?.description ?? '',
     parameters: t.function?.parameters ?? {},
   }));
-  const routed = routeToolsForModel(resolved, tools, textOnlyToolFallback);
-
   const multimodalMessages: ChatHistoryItem[] = request.messages.map((m) => mapMessageToHistoryItem(m));
 
   const { streamChatEvents } = await import('./cloud-direct/index.js');
@@ -546,21 +609,65 @@ async function createNonStreamingResponse(
   type CollectedToolCall = { id: string; name: string; args: string };
   const collectedToolCalls: CollectedToolCall[] = [];
   let currentToolCall: CollectedToolCall | null = null;
+  const useTranslator = !!resolved.textOnly && tools.length > 0;
+  const translator = useTranslator ? getToolCallTranslatorModel(request.providerOptions) : undefined;
 
-  for await (const ev of streamChatEvents({
-    apiKey: credentials.apiKey,
-    apiServerUrl: credentials.apiServerUrl,
-    modelUid: routed.modelUid,
-    messages: multimodalMessages,
-    tools: routed.tools.length > 0 ? routed.tools : undefined,
-    completionOpts: {
-      maxOutputTokens: requestedMaxTokens,
-    },
-    // Propagate the caller's abort so a client disconnect during a
-    // non-streaming title-gen / summary call actually stops the upstream
-    // cloud request and the billable token usage with it.
-    signal,
-  })) {
+  const eventSource = async function* (): AsyncGenerator<CloudChatEvent> {
+    const common = {
+      apiKey: credentials.apiKey,
+      apiServerUrl: credentials.apiServerUrl,
+      completionOpts: { maxOutputTokens: requestedMaxTokens },
+      // Propagate the caller's abort so a client disconnect during a
+      // non-streaming title-gen / summary call actually stops the upstream
+      // cloud request and the billable token usage with it.
+      signal,
+    };
+
+    if (!useTranslator || !translator) {
+      yield* streamChatEvents({
+        ...common,
+        modelUid: resolved.modelUid,
+        messages: multimodalMessages,
+        tools: tools.length > 0 ? tools : undefined,
+      });
+      return;
+    }
+
+    const opusEvents: CloudChatEvent[] = [];
+    let opusDraft = '';
+    for await (const ev of streamChatEvents({
+      ...common,
+      modelUid: resolved.modelUid,
+      messages: buildOpusToolPlanningMessages(multimodalMessages, tools),
+    })) {
+      opusEvents.push(ev);
+      if (ev.kind === 'text') opusDraft += ev.text;
+    }
+
+    let fallbackSawTool = false;
+    const fallbackEvents: CloudChatEvent[] = [];
+    for await (const ev of streamChatEvents({
+      ...common,
+      modelUid: translator.modelUid,
+      messages: buildToolCallTranslatorMessages(multimodalMessages, opusDraft),
+      tools,
+    })) {
+      fallbackEvents.push(ev);
+      if (ev.kind === 'tool_call_start') fallbackSawTool = true;
+    }
+
+    if (fallbackSawTool) {
+      for (const ev of fallbackEvents) {
+        if (ev.kind === 'text' || ev.kind === 'reasoning') continue;
+        yield ev;
+      }
+      return;
+    }
+
+    for (const ev of opusEvents) yield ev;
+  };
+
+  for await (const ev of eventSource()) {
     if (ev.kind === 'text') {
       collected += ev.text;
     } else if (ev.kind === 'tool_call_start') {
