@@ -203,6 +203,13 @@ function createStreamingResponse(
           description: t.function?.description ?? '',
           parameters: t.function?.parameters ?? {},
         }));
+        const effectiveTools = resolved.textOnly ? [] : tools;
+        if (resolved.textOnly && tools.length > 0) {
+          debugLog.log(
+            `[windsurf-plugin] model=${resolved.modelUid} is text-only in Cognition cloud; ` +
+            `stripping ${tools.length} tool definition(s) to avoid server invalid_argument`,
+          );
+        }
 
         const { streamChatEvents } = await import('./cloud-direct/index.js');
         // Cloud-direct accepts the FULL @ai-sdk multimodal content shape
@@ -225,7 +232,7 @@ function createStreamingResponse(
         let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | null = null;
         let firstChunkSent = false;
         const t0 = Date.now();
-        debugLog.log(`[windsurf-plugin] streamChatEvents starting (model=${resolved.modelUid}, msgs=${multimodalMessages.length}, tools=${tools.length})`);
+        debugLog.log(`[windsurf-plugin] streamChatEvents starting (model=${resolved.modelUid}, msgs=${multimodalMessages.length}, tools=${effectiveTools.length})`);
         let eventCount = 0;
         let textBytes = 0;
         // Thread the caller's `max_tokens` into the proto's
@@ -251,7 +258,7 @@ function createStreamingResponse(
           apiServerUrl: credentials.apiServerUrl,
           modelUid: resolved.modelUid,
           messages: multimodalMessages,
-          tools: tools.length > 0 ? tools : undefined,
+          tools: effectiveTools.length > 0 ? effectiveTools : undefined,
           signal: abort.signal,
           completionOpts: {
             maxOutputTokens: requestedMaxTokens,
@@ -466,6 +473,13 @@ async function createNonStreamingResponse(
     description: t.function?.description ?? '',
     parameters: t.function?.parameters ?? {},
   }));
+  const effectiveTools = resolved.textOnly ? [] : tools;
+  if (resolved.textOnly && tools.length > 0) {
+    debugLog.log(
+      `[windsurf-plugin] model=${resolved.modelUid} is text-only in Cognition cloud; ` +
+      `stripping ${tools.length} tool definition(s) to avoid server invalid_argument`,
+    );
+  }
 
   const multimodalMessages: ChatHistoryItem[] = request.messages.map((m) => mapMessageToHistoryItem(m));
 
@@ -493,7 +507,7 @@ async function createNonStreamingResponse(
     apiServerUrl: credentials.apiServerUrl,
     modelUid: resolved.modelUid,
     messages: multimodalMessages,
-    tools: tools.length > 0 ? tools : undefined,
+    tools: effectiveTools.length > 0 ? effectiveTools : undefined,
     completionOpts: {
       maxOutputTokens: requestedMaxTokens,
     },
@@ -829,11 +843,15 @@ async function ensureWindsurfProxyServer(): Promise<string> {
             object: 'list',
             data: models.map((id) => {
               const variants = getModelVariants(id);
+              const resolved = resolveModel(id);
+              const supportsTools = !resolved.textOnly;
               return {
                 id,
                 object: 'model',
                 created: Math.floor(Date.now() / 1000),
                 owned_by: 'windsurf',
+                capabilities: { tools: supportsTools },
+                text_only: !supportsTools,
                 ...(variants
                   ? {
                       variants: Object.entries(variants).map(([name, meta]) => ({

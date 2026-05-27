@@ -111,6 +111,11 @@ type ModelCatalogEntry = {
   variants?: Record<VariantName, VariantMeta>;
   /** Aliases accepted for backwards compatibility */
   aliases?: string[];
+  /**
+   * True when Cognition's cloud rejects tool-bearing requests for every
+   * variant of this model. The plugin strips tools and warns the user.
+   */
+  textOnly?: boolean;
 };
 
 // ==========================================================================
@@ -134,6 +139,7 @@ const VARIANT_CATALOG: Record<string, ModelCatalogEntry> = {
   'claude-opus-4.5': {
     id: 'claude-opus-4.5',
     defaultUid: 'MODEL_CLAUDE_4_5_OPUS',
+    textOnly: true,
     variants: {
       'base': { modelUid: 'MODEL_CLAUDE_4_5_OPUS', description: 'Claude Opus 4.5' },
       'thinking': { modelUid: 'MODEL_CLAUDE_4_5_OPUS_THINKING', description: 'Claude Opus 4.5 Thinking' },
@@ -143,6 +149,7 @@ const VARIANT_CATALOG: Record<string, ModelCatalogEntry> = {
   'claude-opus-4.6': {
     id: 'claude-opus-4.6',
     defaultUid: 'claude-opus-4-6-thinking',
+    textOnly: true,
     variants: {
       'thinking': { modelUid: 'claude-opus-4-6-thinking', description: 'Claude Opus 4.6 Thinking' },
       'base': { modelUid: 'claude-opus-4-6', description: 'Claude Opus 4.6' },
@@ -156,6 +163,7 @@ const VARIANT_CATALOG: Record<string, ModelCatalogEntry> = {
   'claude-opus-4.7': {
     id: 'claude-opus-4.7',
     defaultUid: 'claude-opus-4-7-medium',
+    textOnly: true,
     variants: {
       'medium': { modelUid: 'claude-opus-4-7-medium', description: 'Claude Opus 4.7 Medium' },
       'low': { modelUid: 'claude-opus-4-7-low', description: 'Claude Opus 4.7 Low' },
@@ -173,6 +181,7 @@ const VARIANT_CATALOG: Record<string, ModelCatalogEntry> = {
   'claude-sonnet-4.5': {
     id: 'claude-sonnet-4.5',
     defaultUid: 'MODEL_PRIVATE_2',
+    textOnly: true,
     variants: {
       '2': { modelUid: 'MODEL_PRIVATE_2', description: 'Claude Sonnet 4.5' },
       '3': { modelUid: 'MODEL_PRIVATE_3', description: 'Claude Sonnet 4.5 Thinking' },
@@ -182,6 +191,7 @@ const VARIANT_CATALOG: Record<string, ModelCatalogEntry> = {
   'claude-sonnet-4.6': {
     id: 'claude-sonnet-4.6',
     defaultUid: 'claude-sonnet-4-6-thinking',
+    textOnly: true,
     variants: {
       'thinking': { modelUid: 'claude-sonnet-4-6-thinking', description: 'Claude Sonnet 4.6 Thinking' },
       'base': { modelUid: 'claude-sonnet-4-6', description: 'Claude Sonnet 4.6' },
@@ -420,6 +430,7 @@ const VARIANT_CATALOG: Record<string, ModelCatalogEntry> = {
   'claude-3.7-sonnet': {
     id: 'claude-3.7-sonnet',
     defaultEnum: ModelEnum.CLAUDE_3_7_SONNET_20250219,
+    textOnly: true,
     variants: {
       thinking: { enumValue: ModelEnum.CLAUDE_3_7_SONNET_20250219_THINKING, description: 'Thinking mode' },
     },
@@ -428,6 +439,7 @@ const VARIANT_CATALOG: Record<string, ModelCatalogEntry> = {
   'claude-4-opus': {
     id: 'claude-4-opus',
     defaultEnum: ModelEnum.CLAUDE_4_OPUS,
+    textOnly: true,
     variants: {
       thinking: { enumValue: ModelEnum.CLAUDE_4_OPUS_THINKING, description: 'Thinking mode' },
     },
@@ -435,6 +447,7 @@ const VARIANT_CATALOG: Record<string, ModelCatalogEntry> = {
   'claude-4-sonnet': {
     id: 'claude-4-sonnet',
     defaultEnum: ModelEnum.CLAUDE_4_SONNET,
+    textOnly: true,
     variants: {
       thinking: { enumValue: ModelEnum.CLAUDE_4_SONNET_THINKING, description: 'Thinking mode' },
     },
@@ -442,6 +455,7 @@ const VARIANT_CATALOG: Record<string, ModelCatalogEntry> = {
   'claude-4.1-opus': {
     id: 'claude-4.1-opus',
     defaultEnum: ModelEnum.CLAUDE_4_1_OPUS,
+    textOnly: true,
     variants: {
       thinking: { enumValue: ModelEnum.CLAUDE_4_1_OPUS_THINKING, description: 'Thinking mode' },
     },
@@ -450,6 +464,7 @@ const VARIANT_CATALOG: Record<string, ModelCatalogEntry> = {
   'claude-4.5-sonnet': {
     id: 'claude-4.5-sonnet',
     defaultEnum: ModelEnum.CLAUDE_4_5_SONNET,
+    textOnly: true,
     variants: {
       thinking: { enumValue: ModelEnum.CLAUDE_4_5_SONNET_THINKING, description: 'Thinking mode' },
     },
@@ -458,6 +473,7 @@ const VARIANT_CATALOG: Record<string, ModelCatalogEntry> = {
   'claude-4.5-opus': {
     id: 'claude-4.5-opus',
     defaultEnum: ModelEnum.CLAUDE_4_5_OPUS,
+    textOnly: true,
     variants: {
       thinking: { enumValue: ModelEnum.CLAUDE_4_5_OPUS_THINKING, description: 'Thinking mode' },
     },
@@ -1045,6 +1061,8 @@ export interface ResolvedModel {
   variant?: string;
   /** Legacy proto-enum value. Undefined for Cognition-era string-UID models. */
   enumValue?: ModelEnumValue;
+  /** True when the cloud API rejects tool-bearing requests for this model. */
+  textOnly?: boolean;
 }
 
 export function resolveModel(modelName: string, variantOverride?: string): ResolvedModel {
@@ -1061,9 +1079,10 @@ export function resolveModel(modelName: string, variantOverride?: string): Resol
         modelUid: uidForVariant(v) ?? uidForEntry(entry),
         enumValue: v.enumValue,
         variant: effectiveVariant,
+        textOnly: entry.textOnly,
       };
     }
-    return { modelId: entry.id, modelUid: uidForEntry(entry), enumValue: entry.defaultEnum };
+    return { modelId: entry.id, modelUid: uidForEntry(entry), enumValue: entry.defaultEnum, textOnly: entry.textOnly };
   }
 
   // Fallback to legacy alias table (proto-enum-only models).

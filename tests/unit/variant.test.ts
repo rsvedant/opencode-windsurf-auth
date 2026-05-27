@@ -46,6 +46,12 @@ describe('resolveModel variants', () => {
     expect(resolveModel('gpt-5.2:low').modelUid).toBe('MODEL_GPT_5_2_LOW');
     expect(resolveModel('gpt-5.2:high-priority').modelUid).toBe('MODEL_GPT_5_2_HIGH_PRIORITY');
   });
+
+  test('marks Claude cloud models as text-only', () => {
+    expect(resolveModel('claude-opus-4.7').textOnly).toBe(true);
+    expect(resolveModel('claude-sonnet-4.6').textOnly).toBe(true);
+    expect(resolveModel('swe-1.6').textOnly).toBeUndefined();
+  });
 });
 
 describe('getModelVariants', () => {
