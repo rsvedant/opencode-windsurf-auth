@@ -112,6 +112,61 @@ interface ChatCompletionRequest {
 
 type ToolDef = NonNullable<ChatCompletionRequest['tools']>[number];
 
+type CloudToolDef = {
+  name: string;
+  description: string;
+  parameters: unknown;
+};
+
+const DEFAULT_TEXT_ONLY_TOOL_FALLBACK_MODEL = 'swe-1.6';
+
+function routeToolsForModel(
+  resolved: ReturnType<typeof resolveModel>,
+  tools: CloudToolDef[],
+  fallbackOverride?: string,
+): { modelUid: string; tools: CloudToolDef[]; fallbackModelId?: string } {
+  if (!resolved.textOnly || tools.length === 0) {
+    return { modelUid: resolved.modelUid, tools };
+  }
+
+  const fallbackName =
+    fallbackOverride?.trim() ||
+    process.env.OPENCODE_WINDSURF_TEXT_ONLY_TOOL_FALLBACK_MODEL?.trim() ||
+    DEFAULT_TEXT_ONLY_TOOL_FALLBACK_MODEL;
+  const fallback = resolveModel(fallbackName);
+  if (fallback.textOnly) {
+    throw new Error(
+      `Model "${resolved.modelId}" cannot use tools through Cognition cloud, and fallback ` +
+      `"${fallbackName}" is also marked text-only. Set ` +
+      `OPENCODE_WINDSURF_TEXT_ONLY_TOOL_FALLBACK_MODEL to a tool-capable model like swe-1.6.`,
+    );
+  }
+
+  debugLog.log(
+    `[windsurf-plugin] model=${resolved.modelUid} is text-only in Cognition cloud; ` +
+    `routing tool-bearing turn to fallback model=${fallback.modelUid} with ${tools.length} tool definition(s)`,
+  );
+  return { modelUid: fallback.modelUid, tools, fallbackModelId: fallback.modelId };
+}
+
+function extractTextOnlyToolFallbackFromProviderOptions(providerOptions: Record<string, unknown> | undefined): string | undefined {
+  if (!providerOptions) return undefined;
+  const windsurfRaw = providerOptions['windsurf'];
+  const windsurf =
+    windsurfRaw && typeof windsurfRaw === 'object'
+      ? (windsurfRaw as Record<string, unknown>)
+      : undefined;
+  const pickString = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
+  return (
+    pickString(windsurf?.['textOnlyToolFallbackModel']) ??
+    pickString(windsurf?.['toolFallbackModel']) ??
+    pickString(windsurf?.['fallbackModel']) ??
+    pickString(providerOptions['textOnlyToolFallbackModel']) ??
+    pickString(providerOptions['toolFallbackModel']) ??
+    pickString(providerOptions['fallbackModel'])
+  );
+}
+
 /**
  * Map an opencode/OpenAI-shaped chat message into the ChatHistoryItem the
  * cloud-direct encoder expects. Importantly, this preserves `tool_call_id`
@@ -190,6 +245,7 @@ function createStreamingResponse(
   const responseId = `chatcmpl-${crypto.randomUUID()}`;
   const requestedModel = request.model || getDefaultModel();
   const variantOverride = extractVariantFromProviderOptions(request.providerOptions);
+  const textOnlyToolFallback = extractTextOnlyToolFallbackFromProviderOptions(request.providerOptions);
 
   const abort = new AbortController();
 
@@ -203,13 +259,7 @@ function createStreamingResponse(
           description: t.function?.description ?? '',
           parameters: t.function?.parameters ?? {},
         }));
-        const effectiveTools = resolved.textOnly ? [] : tools;
-        if (resolved.textOnly && tools.length > 0) {
-          debugLog.log(
-            `[windsurf-plugin] model=${resolved.modelUid} is text-only in Cognition cloud; ` +
-            `stripping ${tools.length} tool definition(s) to avoid server invalid_argument`,
-          );
-        }
+        const routed = routeToolsForModel(resolved, tools, textOnlyToolFallback);
 
         const { streamChatEvents } = await import('./cloud-direct/index.js');
         // Cloud-direct accepts the FULL @ai-sdk multimodal content shape
@@ -232,7 +282,7 @@ function createStreamingResponse(
         let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | null = null;
         let firstChunkSent = false;
         const t0 = Date.now();
-        debugLog.log(`[windsurf-plugin] streamChatEvents starting (model=${resolved.modelUid}, msgs=${multimodalMessages.length}, tools=${effectiveTools.length})`);
+        debugLog.log(`[windsurf-plugin] streamChatEvents starting (model=${routed.modelUid}, requested=${resolved.modelUid}, msgs=${multimodalMessages.length}, tools=${routed.tools.length})`);
         let eventCount = 0;
         let textBytes = 0;
         // Thread the caller's `max_tokens` into the proto's
@@ -256,9 +306,9 @@ function createStreamingResponse(
         for await (const ev of streamChatEvents({
           apiKey: credentials.apiKey,
           apiServerUrl: credentials.apiServerUrl,
-          modelUid: resolved.modelUid,
+          modelUid: routed.modelUid,
           messages: multimodalMessages,
-          tools: effectiveTools.length > 0 ? effectiveTools : undefined,
+          tools: routed.tools.length > 0 ? routed.tools : undefined,
           signal: abort.signal,
           completionOpts: {
             maxOutputTokens: requestedMaxTokens,
@@ -466,6 +516,7 @@ async function createNonStreamingResponse(
   const responseId = `chatcmpl-${crypto.randomUUID()}`;
   const requestedModel = request.model || getDefaultModel();
   const variantOverride = extractVariantFromProviderOptions(request.providerOptions);
+  const textOnlyToolFallback = extractTextOnlyToolFallbackFromProviderOptions(request.providerOptions);
   const resolved = resolveModel(requestedModel, variantOverride);
 
   const tools = (request.tools ?? []).map((t) => ({
@@ -473,13 +524,7 @@ async function createNonStreamingResponse(
     description: t.function?.description ?? '',
     parameters: t.function?.parameters ?? {},
   }));
-  const effectiveTools = resolved.textOnly ? [] : tools;
-  if (resolved.textOnly && tools.length > 0) {
-    debugLog.log(
-      `[windsurf-plugin] model=${resolved.modelUid} is text-only in Cognition cloud; ` +
-      `stripping ${tools.length} tool definition(s) to avoid server invalid_argument`,
-    );
-  }
+  const routed = routeToolsForModel(resolved, tools, textOnlyToolFallback);
 
   const multimodalMessages: ChatHistoryItem[] = request.messages.map((m) => mapMessageToHistoryItem(m));
 
@@ -505,9 +550,9 @@ async function createNonStreamingResponse(
   for await (const ev of streamChatEvents({
     apiKey: credentials.apiKey,
     apiServerUrl: credentials.apiServerUrl,
-    modelUid: resolved.modelUid,
+    modelUid: routed.modelUid,
     messages: multimodalMessages,
-    tools: effectiveTools.length > 0 ? effectiveTools : undefined,
+    tools: routed.tools.length > 0 ? routed.tools : undefined,
     completionOpts: {
       maxOutputTokens: requestedMaxTokens,
     },
