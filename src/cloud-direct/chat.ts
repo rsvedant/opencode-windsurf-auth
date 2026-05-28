@@ -724,15 +724,16 @@ function decodeUsageBlock(buf: Buffer): CloudChatEvent | null {
     }
   }
   if (promptTokens === undefined && completionTokens === undefined) return null;
-  // totalTokens reflects what OpenAI's API counts as billable: input +
-  // output. Cached / cache-creation / reasoning subtotals are surfaced as
-  // additional fields so callers that want a fuller picture (e.g. cost
-  // breakdown for reasoning models) can read them, but they're NOT
-  // double-counted into total.
-  const total = (promptTokens ?? 0) + (completionTokens ?? 0);
+  // Cognition reports cache reads/writes separately from fresh input tokens.
+  // OpenAI-compatible callers expect `prompt_tokens` to represent the full
+  // effective prompt size (including cached prompt), and opencode uses it for
+  // context-window display. Preserve the cache subtotals too for callers that
+  // want cost details.
+  const fullPromptTokens = (promptTokens ?? 0) + (cachedInputTokens ?? 0) + (cacheCreationInputTokens ?? 0);
+  const total = fullPromptTokens + (completionTokens ?? 0);
   return {
     kind: 'usage',
-    promptTokens,
+    promptTokens: fullPromptTokens > 0 ? fullPromptTokens : undefined,
     completionTokens,
     totalTokens: total > 0 ? total : undefined,
     cachedInputTokens,

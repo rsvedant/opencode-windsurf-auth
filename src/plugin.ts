@@ -283,6 +283,35 @@ function roleOrder(messages: ChatHistoryItem[]): string {
   return messages.map((m) => m.role).join(',');
 }
 
+function messageByteSummary(messages: ChatHistoryItem[], label: string): string {
+  const sizes = messages.map((m, i) => ({ i, role: m.role, bytes: Buffer.byteLength(contentToText(m.content), 'utf8') }));
+  const total = sizes.reduce((n, s) => n + s.bytes, 0);
+  const largest = sizes
+    .slice()
+    .sort((a, b) => b.bytes - a.bytes)
+    .slice(0, 5)
+    .map((s) => `${s.i}:${s.role}:${s.bytes}B`)
+    .join(',');
+  return `${label} totalText=${total}B largest=${largest}`;
+}
+
+function usageSummary(events: CloudChatEvent[], label: string): string {
+  const usage = events.filter((ev): ev is Extract<CloudChatEvent, { kind: 'usage' }> => ev.kind === 'usage');
+  if (usage.length === 0) return `${label}=none`;
+  return `${label}=${usage.map((u) => JSON.stringify({
+    prompt: u.promptTokens,
+    completion: u.completionTokens,
+    total: u.totalTokens,
+    cached: u.cachedInputTokens,
+    cacheCreate: u.cacheCreationInputTokens,
+    reasoning: u.reasoningTokens,
+  })).join('+')}`;
+}
+
+function isSocketClosedError(error: unknown): boolean {
+  return error instanceof Error && /socket connection was closed unexpectedly/i.test(error.message);
+}
+
 function contentToText(content: ChatHistoryItem['content']): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return String(content ?? '');
@@ -295,6 +324,25 @@ function contentToText(content: ChatHistoryItem['content']): string {
     })
     .filter(Boolean)
     .join('\n');
+}
+
+function truncateMiddle(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  const marker = `\n\n[...truncated oversized tool output for retry...]\n\n`;
+  const targetChars = Math.max(0, maxBytes - marker.length);
+  const head = Math.floor(targetChars * 0.6);
+  const tail = targetChars - head;
+  return `${text.slice(0, head)}${marker}${text.slice(-tail)}`;
+}
+
+function compactOversizedToolMessagesForRetry(messages: ChatHistoryItem[]): ChatHistoryItem[] {
+  const maxToolBytes = 12_000;
+  return messages.map((m) => {
+    if (m.role !== 'tool') return m;
+    const text = contentToText(m.content);
+    if (Buffer.byteLength(text, 'utf8') <= maxToolBytes) return m;
+    return { ...m, content: truncateMiddle(text, maxToolBytes) } satisfies ChatHistoryItem;
+  });
 }
 
 function flattenToolHistoryMessages(messages: ChatHistoryItem[]): ChatHistoryItem[] {
@@ -415,6 +463,32 @@ function syntheticBashToolCallFromDraft(draft: string, tools: CloudToolDef[]): C
     { kind: 'tool_call_args', id, argsDelta: JSON.stringify(args) },
     { kind: 'finish', reason: 'tool_calls' },
   ];
+}
+
+function combinedUsageEvent(...eventGroups: CloudChatEvent[][]): CloudChatEvent | undefined {
+  const usageEvents = eventGroups.flat().filter((ev): ev is Extract<CloudChatEvent, { kind: 'usage' }> => ev.kind === 'usage');
+  if (usageEvents.length === 0) return undefined;
+  const sum = (key: keyof Omit<Extract<CloudChatEvent, { kind: 'usage' }>, 'kind'>): number | undefined => {
+    let total = 0;
+    let seen = false;
+    for (const ev of usageEvents) {
+      const value = ev[key];
+      if (typeof value === 'number') {
+        total += value;
+        seen = true;
+      }
+    }
+    return seen ? total : undefined;
+  };
+  return {
+    kind: 'usage',
+    promptTokens: sum('promptTokens'),
+    completionTokens: sum('completionTokens'),
+    totalTokens: sum('totalTokens'),
+    cachedInputTokens: sum('cachedInputTokens'),
+    cacheCreationInputTokens: sum('cacheCreationInputTokens'),
+    reasoningTokens: sum('reasoningTokens'),
+  };
 }
 
 /**
@@ -538,6 +612,10 @@ function createStreamingResponse(
           ? buildToolResultMessages(multimodalMessages, toolConfig)
           : multimodalMessages;
         debugLog.log(`[windsurf-plugin] streamChatEvents starting (model=${resolved.modelUid}, plannerMsgs=${passthroughMessages.length}, resultMsgs=${resultMessages.length}, tools=${useTranslator ? 0 : tools.length}, toolCallTranslator=${translator?.modelUid ?? 'none'}, intent=${toolConfig.toolIntentDetection}, resultContext=${shouldReduceToolResultContext ? `${toolConfig.toolResultContext}:${toolConfig.toolResultContextMessages}` : 'passthrough'})`);
+        if (debugLog.enabled) {
+          debugLog.log(`[windsurf-plugin] ${messageByteSummary(passthroughMessages, 'planner')}`);
+          if (resultMessages !== passthroughMessages) debugLog.log(`[windsurf-plugin] ${messageByteSummary(resultMessages, 'result')}`);
+        }
         if (shouldReduceToolResultContext) debugLog.log(`[windsurf-plugin] reduced result context roles=${roleOrder(resultMessages)}`);
         let eventCount = 0;
         let textBytes = 0;
@@ -578,15 +656,31 @@ function createStreamingResponse(
             return;
           }
 
-          const opusEvents: CloudChatEvent[] = [];
+          let opusEvents: CloudChatEvent[] = [];
           let opusDraft = '';
-          for await (const ev of streamChatEvents({
-            ...common,
-            modelUid: resolved.modelUid,
-            messages: buildOpusToolPlanningMessages(passthroughMessages, tools),
-          })) {
-            opusEvents.push(ev);
-            if (ev.kind === 'text') opusDraft += ev.text;
+          try {
+            for await (const ev of streamChatEvents({
+              ...common,
+              modelUid: resolved.modelUid,
+              messages: buildOpusToolPlanningMessages(passthroughMessages, tools),
+            })) {
+              opusEvents.push(ev);
+              if (ev.kind === 'text') opusDraft += ev.text;
+            }
+          } catch (error) {
+            if (!isSocketClosedError(error)) throw error;
+            const retryMessages = compactOversizedToolMessagesForRetry(passthroughMessages);
+            debugLog.log(`[windsurf-plugin] opus planner socket closed; retrying with compacted oversized tool outputs (${messageByteSummary(retryMessages, 'plannerRetry')})`);
+            opusEvents = [];
+            opusDraft = '';
+            for await (const ev of streamChatEvents({
+              ...common,
+              modelUid: resolved.modelUid,
+              messages: buildOpusToolPlanningMessages(retryMessages, tools),
+            })) {
+              opusEvents.push(ev);
+              if (ev.kind === 'text') opusDraft += ev.text;
+            }
           }
 
           debugLog.log(`[windsurf-plugin] opus planner draft (${opusDraft.length}B): ${opusDraft.slice(0, 500).replace(/\n/g, '\\n')}`);
@@ -618,9 +712,12 @@ function createStreamingResponse(
                 storePlannerDraft(ev.id, { draft: opusDraft, modelUid: resolved.modelUid });
                 debugLog.log(`[windsurf-plugin] stored opus planner draft for tool_call_id=${ev.id}`);
               }
-              if (ev.kind === 'text' || ev.kind === 'reasoning') continue;
+              if (ev.kind === 'text' || ev.kind === 'reasoning' || ev.kind === 'usage') continue;
               yield ev;
             }
+            const usage = combinedUsageEvent(opusEvents, fallbackEvents);
+            debugLog.log(`[windsurf-plugin] bridge usage ${usageSummary(opusEvents, 'planner')} ${usageSummary(fallbackEvents, 'translator')} combined=${usage ? JSON.stringify(usage) : 'none'}`);
+            if (usage) yield usage;
             return;
           }
 
@@ -631,11 +728,19 @@ function createStreamingResponse(
               if (ev.kind === 'tool_call_start') storePlannerDraft(ev.id, { draft: opusDraft, modelUid: resolved.modelUid });
               yield ev;
             }
+            const usage = combinedUsageEvent(opusEvents, fallbackEvents);
+            debugLog.log(`[windsurf-plugin] bridge usage ${usageSummary(opusEvents, 'planner')} ${usageSummary(fallbackEvents, 'translator')} combined=${usage ? JSON.stringify(usage) : 'none'}`);
+            if (usage) yield usage;
             return;
           }
 
           debugLog.log(`[windsurf-plugin] tool-call translator model=${translator.modelUid} emitted no tool call; streaming opus draft`);
-          for (const ev of opusEvents) yield ev;
+          for (const ev of opusEvents) {
+            if (ev.kind !== 'usage') yield ev;
+          }
+          const usage = combinedUsageEvent(opusEvents, fallbackEvents);
+          debugLog.log(`[windsurf-plugin] bridge usage ${usageSummary(opusEvents, 'planner')} ${usageSummary(fallbackEvents, 'translator')} combined=${usage ? JSON.stringify(usage) : 'none'}`);
+          if (usage) yield usage;
         };
 
         for await (const ev of eventSource()) {
@@ -899,15 +1004,31 @@ async function createNonStreamingResponse(
       return;
     }
 
-    const opusEvents: CloudChatEvent[] = [];
+    let opusEvents: CloudChatEvent[] = [];
     let opusDraft = '';
-    for await (const ev of streamChatEvents({
-      ...common,
-      modelUid: resolved.modelUid,
-      messages: buildOpusToolPlanningMessages(passthroughMessages, tools),
-    })) {
-      opusEvents.push(ev);
-      if (ev.kind === 'text') opusDraft += ev.text;
+    try {
+      for await (const ev of streamChatEvents({
+        ...common,
+        modelUid: resolved.modelUid,
+        messages: buildOpusToolPlanningMessages(passthroughMessages, tools),
+      })) {
+        opusEvents.push(ev);
+        if (ev.kind === 'text') opusDraft += ev.text;
+      }
+    } catch (error) {
+      if (!isSocketClosedError(error)) throw error;
+      const retryMessages = compactOversizedToolMessagesForRetry(passthroughMessages);
+      debugLog.log(`[windsurf-plugin] nonstream opus planner socket closed; retrying with compacted oversized tool outputs (${messageByteSummary(retryMessages, 'plannerRetry')})`);
+      opusEvents = [];
+      opusDraft = '';
+      for await (const ev of streamChatEvents({
+        ...common,
+        modelUid: resolved.modelUid,
+        messages: buildOpusToolPlanningMessages(retryMessages, tools),
+      })) {
+        opusEvents.push(ev);
+        if (ev.kind === 'text') opusDraft += ev.text;
+      }
     }
 
     if (!shouldCallToolTranslator(opusDraft, toolConfig.toolIntentDetection)) {
@@ -933,9 +1054,11 @@ async function createNonStreamingResponse(
         if (ev.kind === 'tool_call_start') {
           storePlannerDraft(ev.id, { draft: opusDraft, modelUid: resolved.modelUid });
         }
-        if (ev.kind === 'text' || ev.kind === 'reasoning') continue;
+        if (ev.kind === 'text' || ev.kind === 'reasoning' || ev.kind === 'usage') continue;
         yield ev;
       }
+      const usage = combinedUsageEvent(opusEvents, fallbackEvents);
+      if (usage) yield usage;
       return;
     }
 
@@ -947,10 +1070,16 @@ async function createNonStreamingResponse(
         }
         yield ev;
       }
+      const usage = combinedUsageEvent(opusEvents, fallbackEvents);
+      if (usage) yield usage;
       return;
     }
 
-    for (const ev of opusEvents) yield ev;
+    for (const ev of opusEvents) {
+      if (ev.kind !== 'usage') yield ev;
+    }
+    const usage = combinedUsageEvent(opusEvents, fallbackEvents);
+    if (usage) yield usage;
   };
 
   for await (const ev of eventSource()) {
