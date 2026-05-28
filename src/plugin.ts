@@ -122,7 +122,7 @@ const DEFAULT_TOOL_CALL_TRANSLATOR_MODEL = 'swe-1.6';
 const DEFAULT_TOOL_INTENT_DETECTION: ToolIntentDetectionMode = 'always';
 const DEFAULT_TOOL_TRANSLATOR_CONTEXT_MESSAGES = 8;
 const DEFAULT_TOOL_RESULT_CONTEXT: ToolResultContextMode = 'tail';
-const DEFAULT_TOOL_RESULT_CONTEXT_MESSAGES = 24;
+const DEFAULT_TOOL_RESULT_CONTEXT_MESSAGES = 64;
 const MAX_STORED_PLANNER_DRAFTS = 200;
 
 type ToolIntentDetectionMode = 'always' | 'assist' | 'marker';
@@ -261,16 +261,26 @@ function buildOpusToolPlanningMessages(messages: ChatHistoryItem[], tools: Cloud
         `Native tool schemas cannot be sent to this model, but opencode can still execute tools after your decision.\n` +
         `You are responsible for planning the next step.\n` +
         `If the next step needs a command, file read/edit/search, todo update, web fetch, or any tool action, describe the intended tool action plainly.\n` +
+        `Do not ask the user for build commands, paths, files, status, or other facts that tools can inspect. Plan the tool inspection instead.\n` +
+        `If the user asks you to build, flash, test, inspect, continue work, or verify hardware/logs, plan a tool action unless the answer is already proven by the latest context.\n` +
         `Prefer: TOOL_INTENT: <tool name> <arguments/purpose>.\n` +
         `Do not invent tool output and do not continue as if a tool already ran.\n` +
-        `If no tool is needed, answer normally.\n\n` +
+        `If no tool is needed, answer normally. Never prefix answers with "No tool needed".\n\n` +
         `Available tools:\n${JSON.stringify(manifest)}`,
     },
   ];
 }
 
-function recentMessages(messages: ChatHistoryItem[], count: number): ChatHistoryItem[] {
-  return messages.filter((m) => m.role !== 'system').slice(-count);
+function recentMessagesWithLatestUser(messages: ChatHistoryItem[], count: number): ChatHistoryItem[] {
+  const nonSystem = messages.filter((m) => m.role !== 'system');
+  const tail = nonSystem.slice(-count);
+  const latestUser = latestUserMessage(nonSystem);
+  if (!latestUser || tail.includes(latestUser)) return tail;
+  return [latestUser, ...tail];
+}
+
+function roleOrder(messages: ChatHistoryItem[]): string {
+  return messages.map((m) => m.role).join(',');
 }
 
 function contentToText(content: ChatHistoryItem['content']): string {
@@ -331,11 +341,7 @@ function plannerDraftContext(messages: ChatHistoryItem[]): string {
 }
 
 function buildToolCallTranslatorMessages(messages: ChatHistoryItem[], opusDraft: string, tailCount: number): ChatHistoryItem[] {
-  const latestUser = latestUserMessage(messages);
-  const tail = recentMessages(messages, tailCount);
-  const context: ChatHistoryItem[] = flattenToolHistoryMessages(
-    latestUser ? [latestUser, ...tail.filter((m) => m !== latestUser)] : tail,
-  );
+  const context: ChatHistoryItem[] = flattenToolHistoryMessages(recentMessagesWithLatestUser(messages, tailCount));
   return [
     ...context,
     {
@@ -345,7 +351,9 @@ function buildToolCallTranslatorMessages(messages: ChatHistoryItem[], opusDraft:
         `<opus_draft>\n${opusDraft}\n</opus_draft>\n\n` +
         `Convert that planned next step into at most one native tool call.\n` +
         `If the draft implies command execution, file read/edit/search, todo update, web fetch, or any tool action, call exactly the matching tool.\n` +
-        `If the draft is a final answer or no tool is needed, respond with exactly: NO_TOOL.\n` +
+        `If the draft says it lacks build commands, paths, files, current status, logs, or other inspectable facts, call an appropriate inspection tool instead of returning NO_TOOL.\n` +
+        `If the latest user asks to build, flash, test, inspect, continue work, or verify hardware/logs, prefer a tool call when any available tool can make progress.\n` +
+        `Return exactly NO_TOOL only when the draft is already a final user-facing answer or no available tool can make progress.\n` +
         `Do not answer the user. Do not add commentary.`,
     },
   ];
@@ -364,10 +372,8 @@ function buildToolResultMessages(messages: ChatHistoryItem[], config: TextOnlyTo
 
   if (config.toolResultContext === 'full') return [...messages, injected];
 
-  const latestUser = latestUserMessage(messages);
   const tailCount = config.toolResultContext === 'minimal' ? 6 : config.toolResultContextMessages;
-  const tail = recentMessages(messages, tailCount);
-  const context = flattenToolHistoryMessages(latestUser ? [latestUser, ...tail.filter((m) => m !== latestUser)] : tail);
+  const context = flattenToolHistoryMessages(recentMessagesWithLatestUser(messages, tailCount));
   return [...context, injected];
 }
 
@@ -376,6 +382,39 @@ function shouldCallToolTranslator(draft: string, mode: ToolIntentDetectionMode):
   if (/\bTOOL_INTENT\s*:/i.test(draft)) return true;
   if (mode === 'marker') return false;
   return /\b(?:I'll|I will|let me|now|next I'll|I need to)\s+(?:run|execute|read|inspect|check|edit|search|grep|build|flash|capture|write|update)\b/i.test(draft);
+}
+
+function hasToolResultMessages(messages: ChatHistoryItem[]): boolean {
+  return messages.some((m) => m.role === 'tool');
+}
+
+function syntheticBashToolCallFromDraft(draft: string, tools: CloudToolDef[]): CloudChatEvent[] | undefined {
+  if (!tools.some((t) => t.name === 'bash')) return undefined;
+
+  const command =
+    draft.match(/<parameter\s+name=["']command["']>([\s\S]*?)(?:<\/parameter>|$)/i)?.[1]?.trim() ??
+    draft.match(/```tool\s*\n\s*bash\s*:\s*([\s\S]*?)```/i)?.[1]?.trim() ??
+    draft.match(/\bTOOL_INTENT\s*:[^\n]*\bbash\b[^\n`]*`([^`]+)`/i)?.[1]?.trim();
+
+  if (!command) return undefined;
+
+  const workdir =
+    draft.match(/\bworkdir\b\s*`([^`]+)`/i)?.[1] ??
+    draft.match(/\bworkdir\b\s*["']([^"']+)["']/i)?.[1];
+  const timeoutSeconds = Number(draft.match(/\btimeout\b\s*(\d+)\s*s\b/i)?.[1]);
+  const args: Record<string, unknown> = {
+    command,
+    description: 'Run planned command',
+  };
+  if (workdir) args.workdir = workdir;
+  if (Number.isFinite(timeoutSeconds) && timeoutSeconds > 0) args.timeout = timeoutSeconds * 1000;
+
+  const id = `call_${crypto.randomBytes(12).toString('hex')}`;
+  return [
+    { kind: 'tool_call_start', id, name: 'bash' },
+    { kind: 'tool_call_args', id, argsDelta: JSON.stringify(args) },
+    { kind: 'finish', reason: 'tool_calls' },
+  ];
 }
 
 /**
@@ -493,10 +532,13 @@ function createStreamingResponse(
         const toolConfig = resolveToolConfig(request.providerOptions);
         const useTranslator = !!resolved.textOnly && tools.length > 0;
         const translator = useTranslator ? getToolCallTranslatorModel(request.providerOptions) : undefined;
-        const opusMessages = resolved.textOnly
+        const shouldReduceToolResultContext = useTranslator && hasToolResultMessages(multimodalMessages);
+        const passthroughMessages = multimodalMessages;
+        const resultMessages = shouldReduceToolResultContext
           ? buildToolResultMessages(multimodalMessages, toolConfig)
           : multimodalMessages;
-        debugLog.log(`[windsurf-plugin] streamChatEvents starting (model=${resolved.modelUid}, msgs=${opusMessages.length}, tools=${useTranslator ? 0 : tools.length}, toolCallTranslator=${translator?.modelUid ?? 'none'}, intent=${toolConfig.toolIntentDetection}, resultContext=${toolConfig.toolResultContext}:${toolConfig.toolResultContextMessages})`);
+        debugLog.log(`[windsurf-plugin] streamChatEvents starting (model=${resolved.modelUid}, plannerMsgs=${passthroughMessages.length}, resultMsgs=${resultMessages.length}, tools=${useTranslator ? 0 : tools.length}, toolCallTranslator=${translator?.modelUid ?? 'none'}, intent=${toolConfig.toolIntentDetection}, resultContext=${shouldReduceToolResultContext ? `${toolConfig.toolResultContext}:${toolConfig.toolResultContextMessages}` : 'passthrough'})`);
+        if (shouldReduceToolResultContext) debugLog.log(`[windsurf-plugin] reduced result context roles=${roleOrder(resultMessages)}`);
         let eventCount = 0;
         let textBytes = 0;
         // Thread the caller's `max_tokens` into the proto's
@@ -530,7 +572,7 @@ function createStreamingResponse(
             yield* streamChatEvents({
               ...common,
               modelUid: resolved.modelUid,
-              messages: opusMessages,
+              messages: passthroughMessages,
               tools: tools.length > 0 ? tools : undefined,
             });
             return;
@@ -541,7 +583,7 @@ function createStreamingResponse(
           for await (const ev of streamChatEvents({
             ...common,
             modelUid: resolved.modelUid,
-            messages: buildOpusToolPlanningMessages(opusMessages, tools),
+            messages: buildOpusToolPlanningMessages(passthroughMessages, tools),
           })) {
             opusEvents.push(ev);
             if (ev.kind === 'text') opusDraft += ev.text;
@@ -557,10 +599,12 @@ function createStreamingResponse(
 
           let fallbackSawTool = false;
           const fallbackEvents: CloudChatEvent[] = [];
+          const translatorMessages = buildToolCallTranslatorMessages(multimodalMessages, opusDraft, toolConfig.toolTranslatorContextMessages);
+          debugLog.log(`[windsurf-plugin] translator context roles=${roleOrder(translatorMessages)}`);
           for await (const ev of streamChatEvents({
             ...common,
             modelUid: translator.modelUid,
-            messages: buildToolCallTranslatorMessages(multimodalMessages, opusDraft, toolConfig.toolTranslatorContextMessages),
+            messages: translatorMessages,
             tools,
           })) {
             fallbackEvents.push(ev);
@@ -575,6 +619,16 @@ function createStreamingResponse(
                 debugLog.log(`[windsurf-plugin] stored opus planner draft for tool_call_id=${ev.id}`);
               }
               if (ev.kind === 'text' || ev.kind === 'reasoning') continue;
+              yield ev;
+            }
+            return;
+          }
+
+          const syntheticToolCall = syntheticBashToolCallFromDraft(opusDraft, tools);
+          if (syntheticToolCall) {
+            debugLog.log('[windsurf-plugin] synthesized bash tool call from opus draft after translator emitted no tool');
+            for (const ev of syntheticToolCall) {
+              if (ev.kind === 'tool_call_start') storePlannerDraft(ev.id, { draft: opusDraft, modelUid: resolved.modelUid });
               yield ev;
             }
             return;
@@ -817,9 +871,12 @@ async function createNonStreamingResponse(
   const toolConfig = resolveToolConfig(request.providerOptions);
   const useTranslator = !!resolved.textOnly && tools.length > 0;
   const translator = useTranslator ? getToolCallTranslatorModel(request.providerOptions) : undefined;
-  const opusMessages = resolved.textOnly
+  const shouldReduceToolResultContext = useTranslator && hasToolResultMessages(multimodalMessages);
+  const passthroughMessages = multimodalMessages;
+  const resultMessages = shouldReduceToolResultContext
     ? buildToolResultMessages(multimodalMessages, toolConfig)
     : multimodalMessages;
+  debugLog.log(`[windsurf-plugin] nonstream ChatEvents starting (model=${resolved.modelUid}, plannerMsgs=${passthroughMessages.length}, resultMsgs=${resultMessages.length}, tools=${useTranslator ? 0 : tools.length}, toolCallTranslator=${translator?.modelUid ?? 'none'}, intent=${toolConfig.toolIntentDetection}, resultContext=${shouldReduceToolResultContext ? `${toolConfig.toolResultContext}:${toolConfig.toolResultContextMessages}` : 'passthrough'})`);
 
   const eventSource = async function* (): AsyncGenerator<CloudChatEvent> {
     const common = {
@@ -836,7 +893,7 @@ async function createNonStreamingResponse(
       yield* streamChatEvents({
         ...common,
         modelUid: resolved.modelUid,
-        messages: opusMessages,
+        messages: passthroughMessages,
         tools: tools.length > 0 ? tools : undefined,
       });
       return;
@@ -847,7 +904,7 @@ async function createNonStreamingResponse(
     for await (const ev of streamChatEvents({
       ...common,
       modelUid: resolved.modelUid,
-      messages: buildOpusToolPlanningMessages(opusMessages, tools),
+      messages: buildOpusToolPlanningMessages(passthroughMessages, tools),
     })) {
       opusEvents.push(ev);
       if (ev.kind === 'text') opusDraft += ev.text;
@@ -860,10 +917,11 @@ async function createNonStreamingResponse(
 
     let fallbackSawTool = false;
     const fallbackEvents: CloudChatEvent[] = [];
+    const translatorMessages = buildToolCallTranslatorMessages(multimodalMessages, opusDraft, toolConfig.toolTranslatorContextMessages);
     for await (const ev of streamChatEvents({
       ...common,
       modelUid: translator.modelUid,
-      messages: buildToolCallTranslatorMessages(multimodalMessages, opusDraft, toolConfig.toolTranslatorContextMessages),
+      messages: translatorMessages,
       tools,
     })) {
       fallbackEvents.push(ev);
@@ -876,6 +934,17 @@ async function createNonStreamingResponse(
           storePlannerDraft(ev.id, { draft: opusDraft, modelUid: resolved.modelUid });
         }
         if (ev.kind === 'text' || ev.kind === 'reasoning') continue;
+        yield ev;
+      }
+      return;
+    }
+
+    const syntheticToolCall = syntheticBashToolCallFromDraft(opusDraft, tools);
+    if (syntheticToolCall) {
+      for (const ev of syntheticToolCall) {
+        if (ev.kind === 'tool_call_start') {
+          storePlannerDraft(ev.id, { draft: opusDraft, modelUid: resolved.modelUid });
+        }
         yield ev;
       }
       return;

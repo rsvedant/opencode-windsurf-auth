@@ -36,14 +36,21 @@ import { getCachedUserJwt } from './auth.js';
 import { getCachedCatalog, ModelNotAvailableError } from './catalog.js';
 
 /**
- * Connect-RPC streaming inactivity timeout. If the cloud sends zero bytes
- * for this long after the last chunk, we abort the fetch. The cloud's own
- * idle limit is around 90s on most models; we set ours a little above so
- * we only trigger when the server has genuinely stopped responding.
+ * Connect-RPC streaming inactivity timeout. Opus can spend multiple minutes
+ * before its first body chunk on large hardware-debugging contexts, so keep
+ * this above ordinary model thinking latency and let users override it.
  */
-const CLOUD_STREAM_IDLE_MS = 120_000;
+const CLOUD_STREAM_IDLE_MS = readPositiveIntEnv('OPENCODE_WINDSURF_CLOUD_STREAM_IDLE_MS', 300_000);
 /** Time-to-first-byte timeout. */
-const CLOUD_STREAM_TTFB_MS = 60_000;
+const CLOUD_STREAM_TTFB_MS = readPositiveIntEnv('OPENCODE_WINDSURF_CLOUD_STREAM_TTFB_MS', 120_000);
+const DEFAULT_MAX_INPUT_TOKENS = readPositiveIntEnv('OPENCODE_WINDSURF_MAX_INPUT_TOKENS', 256_000);
+
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : fallback;
+}
 
 /**
  * Compose multiple AbortSignals into a single signal that aborts when ANY
@@ -274,7 +281,7 @@ function encodeCompletionConfiguration(opts: {
   };
   return Buffer.concat([
     encodeVarintField(1, 1),
-    encodeVarintField(2, opts.maxInputTokens ?? 64000),
+    encodeVarintField(2, opts.maxInputTokens ?? DEFAULT_MAX_INPUT_TOKENS),
     // Default to the catalog's most permissive `maxOutputTokens` (128K).
     // The cloud clamps to the per-model limit anyway. The old 4096 default
     // would silently truncate any callers (tests, CLI users of
