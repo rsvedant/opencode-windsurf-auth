@@ -69,7 +69,7 @@ const debugLog = (() => {
 import { WindsurfCredentials, WindsurfError } from './plugin/auth.js';
 import { resolveCredentials } from './plugin/credentials-resolver.js';
 import { loadCredentials as loadOAuthCredentials } from './oauth/storage.js';
-import type { ChatHistoryItem } from './cloud-direct/index.js';
+import type { ChatHistoryItem, CloudChatEvent } from './cloud-direct/index.js';
 import {
   getDefaultModel,
   getCanonicalModels,
@@ -111,6 +111,385 @@ interface ChatCompletionRequest {
 }
 
 type ToolDef = NonNullable<ChatCompletionRequest['tools']>[number];
+
+type CloudToolDef = {
+  name: string;
+  description: string;
+  parameters: unknown;
+};
+
+const DEFAULT_TOOL_CALL_TRANSLATOR_MODEL = 'swe-1.6';
+const DEFAULT_TOOL_INTENT_DETECTION: ToolIntentDetectionMode = 'always';
+const DEFAULT_TOOL_TRANSLATOR_CONTEXT_MESSAGES = 8;
+const DEFAULT_TOOL_RESULT_CONTEXT: ToolResultContextMode = 'tail';
+const DEFAULT_TOOL_RESULT_CONTEXT_MESSAGES = 64;
+const MAX_STORED_PLANNER_DRAFTS = 200;
+
+type ToolIntentDetectionMode = 'always' | 'assist' | 'marker';
+type ToolResultContextMode = 'full' | 'tail' | 'minimal';
+
+interface TextOnlyToolConfig {
+  toolIntentDetection: ToolIntentDetectionMode;
+  toolTranslatorContextMessages: number;
+  toolResultContext: ToolResultContextMode;
+  toolResultContextMessages: number;
+}
+
+interface PlannerDraftEntry {
+  draft: string;
+  modelUid: string;
+  createdAt: number;
+}
+
+const plannerDraftByToolCallId = new Map<string, PlannerDraftEntry>();
+
+function storePlannerDraft(toolCallId: string, entry: Omit<PlannerDraftEntry, 'createdAt'>): void {
+  if (!toolCallId || !entry.draft) return;
+  plannerDraftByToolCallId.set(toolCallId, { ...entry, createdAt: Date.now() });
+  while (plannerDraftByToolCallId.size > MAX_STORED_PLANNER_DRAFTS) {
+    const oldest = plannerDraftByToolCallId.keys().next().value;
+    if (!oldest) break;
+    plannerDraftByToolCallId.delete(oldest);
+  }
+}
+
+function extractToolCallTranslatorFromProviderOptions(providerOptions: Record<string, unknown> | undefined): string | undefined {
+  if (!providerOptions) return undefined;
+  const windsurfRaw = providerOptions['windsurf'];
+  const windsurf =
+    windsurfRaw && typeof windsurfRaw === 'object'
+      ? (windsurfRaw as Record<string, unknown>)
+      : undefined;
+  const pickString = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
+  return (
+    pickString(windsurf?.['toolCallTranslatorModel']) ??
+    pickString(windsurf?.['toolFallbackModel']) ??
+    pickString(windsurf?.['fallbackModel']) ??
+    pickString(providerOptions['toolCallTranslatorModel']) ??
+    pickString(providerOptions['toolFallbackModel']) ??
+    pickString(providerOptions['fallbackModel'])
+  );
+}
+
+function windsurfProviderOptions(providerOptions: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!providerOptions) return undefined;
+  const raw = providerOptions['windsurf'];
+  return raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : undefined;
+}
+
+function pickStringConfig(providerOptions: Record<string, unknown> | undefined, key: string): string | undefined {
+  const windsurf = windsurfProviderOptions(providerOptions);
+  const v = windsurf?.[key] ?? providerOptions?.[key];
+  return typeof v === 'string' ? v : undefined;
+}
+
+function pickNumberConfig(providerOptions: Record<string, unknown> | undefined, key: string): number | undefined {
+  const windsurf = windsurfProviderOptions(providerOptions);
+  const v = windsurf?.[key] ?? providerOptions?.[key];
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string' && v.trim() !== '') {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+function clampInt(v: number | undefined, fallback: number, min: number, max: number): number {
+  if (v === undefined || !Number.isFinite(v)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(v)));
+}
+
+function resolveToolConfig(providerOptions: Record<string, unknown> | undefined): TextOnlyToolConfig {
+  const detectionRaw =
+    pickStringConfig(providerOptions, 'toolIntentDetection') ??
+    process.env.OPENCODE_WINDSURF_TOOL_INTENT_DETECTION ??
+    DEFAULT_TOOL_INTENT_DETECTION;
+  const detection: ToolIntentDetectionMode =
+    detectionRaw === 'marker' || detectionRaw === 'assist' || detectionRaw === 'always'
+      ? detectionRaw
+      : DEFAULT_TOOL_INTENT_DETECTION;
+
+  const resultRaw =
+    pickStringConfig(providerOptions, 'toolResultContext') ??
+    process.env.OPENCODE_WINDSURF_TOOL_RESULT_CONTEXT ??
+    DEFAULT_TOOL_RESULT_CONTEXT;
+  const resultContext: ToolResultContextMode =
+    resultRaw === 'full' || resultRaw === 'tail' || resultRaw === 'minimal'
+      ? resultRaw
+      : DEFAULT_TOOL_RESULT_CONTEXT;
+
+  return {
+    toolIntentDetection: detection,
+    toolTranslatorContextMessages: clampInt(
+      pickNumberConfig(providerOptions, 'toolTranslatorContextMessages') ?? Number(process.env.OPENCODE_WINDSURF_TOOL_TRANSLATOR_CONTEXT_MESSAGES),
+      DEFAULT_TOOL_TRANSLATOR_CONTEXT_MESSAGES,
+      1,
+      64,
+    ),
+    toolResultContext: resultContext,
+    toolResultContextMessages: clampInt(
+      pickNumberConfig(providerOptions, 'toolResultContextMessages') ?? Number(process.env.OPENCODE_WINDSURF_TOOL_RESULT_CONTEXT_MESSAGES),
+      DEFAULT_TOOL_RESULT_CONTEXT_MESSAGES,
+      1,
+      128,
+    ),
+  };
+}
+
+function getToolCallTranslatorModel(providerOptions: Record<string, unknown> | undefined): ReturnType<typeof resolveModel> {
+  const fallbackName =
+    extractToolCallTranslatorFromProviderOptions(providerOptions)?.trim() ||
+    process.env.OPENCODE_WINDSURF_TOOL_CALL_TRANSLATOR_MODEL?.trim() ||
+    DEFAULT_TOOL_CALL_TRANSLATOR_MODEL;
+  const fallback = resolveModel(fallbackName);
+  if (fallback.textOnly) {
+    throw new Error(
+      `Tool-call translator model "${fallbackName}" is marked text-only. ` +
+      `Set OPENCODE_WINDSURF_TOOL_CALL_TRANSLATOR_MODEL to a tool-capable model like swe-1.6.`,
+    );
+  }
+  return fallback;
+}
+
+function buildOpusToolPlanningMessages(messages: ChatHistoryItem[], tools: CloudToolDef[]): ChatHistoryItem[] {
+  const manifest = tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
+  return [
+    ...messages,
+    {
+      role: 'system',
+      content:
+        `Native tool schemas cannot be sent to this model, but opencode can still execute tools after your decision.\n` +
+        `You are responsible for planning the next step.\n` +
+        `If the next step needs a command, file read/edit/search, todo update, web fetch, or any tool action, describe the intended tool action plainly.\n` +
+        `Do not ask the user for build commands, paths, files, status, or other facts that tools can inspect. Plan the tool inspection instead.\n` +
+        `If the user asks you to build, flash, test, inspect, continue work, or verify hardware/logs, plan a tool action unless the answer is already proven by the latest context.\n` +
+        `Prefer: TOOL_INTENT: <tool name> <arguments/purpose>.\n` +
+        `Do not invent tool output and do not continue as if a tool already ran.\n` +
+        `If no tool is needed, answer normally. Never prefix answers with "No tool needed".\n\n` +
+        `Available tools:\n${JSON.stringify(manifest)}`,
+    },
+  ];
+}
+
+function recentMessagesWithLatestUser(messages: ChatHistoryItem[], count: number): ChatHistoryItem[] {
+  const nonSystem = messages.filter((m) => m.role !== 'system');
+  const tail = nonSystem.slice(-count);
+  const latestUser = latestUserMessage(nonSystem);
+  if (!latestUser || tail.includes(latestUser)) return tail;
+  return [latestUser, ...tail];
+}
+
+function roleOrder(messages: ChatHistoryItem[]): string {
+  return messages.map((m) => m.role).join(',');
+}
+
+function messageByteSummary(messages: ChatHistoryItem[], label: string): string {
+  const sizes = messages.map((m, i) => ({ i, role: m.role, bytes: Buffer.byteLength(contentToText(m.content), 'utf8') }));
+  const total = sizes.reduce((n, s) => n + s.bytes, 0);
+  const largest = sizes
+    .slice()
+    .sort((a, b) => b.bytes - a.bytes)
+    .slice(0, 5)
+    .map((s) => `${s.i}:${s.role}:${s.bytes}B`)
+    .join(',');
+  return `${label} totalText=${total}B largest=${largest}`;
+}
+
+function usageSummary(events: CloudChatEvent[], label: string): string {
+  const usage = events.filter((ev): ev is Extract<CloudChatEvent, { kind: 'usage' }> => ev.kind === 'usage');
+  if (usage.length === 0) return `${label}=none`;
+  return `${label}=${usage.map((u) => JSON.stringify({
+    prompt: u.promptTokens,
+    completion: u.completionTokens,
+    total: u.totalTokens,
+    cached: u.cachedInputTokens,
+    cacheCreate: u.cacheCreationInputTokens,
+    reasoning: u.reasoningTokens,
+  })).join('+')}`;
+}
+
+function isSocketClosedError(error: unknown): boolean {
+  return error instanceof Error && /socket connection was closed unexpectedly/i.test(error.message);
+}
+
+function contentToText(content: ChatHistoryItem['content']): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return String(content ?? '');
+  return content
+    .map((part) => {
+      if (!part || typeof part !== 'object') return '';
+      if ('text' in part && typeof part.text === 'string') return part.text;
+      if ('image_url' in part) return '[image]';
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function truncateMiddle(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  const marker = `\n\n[...truncated oversized tool output for retry...]\n\n`;
+  const targetChars = Math.max(0, maxBytes - marker.length);
+  const head = Math.floor(targetChars * 0.6);
+  const tail = targetChars - head;
+  return `${text.slice(0, head)}${marker}${text.slice(-tail)}`;
+}
+
+function compactOversizedToolMessagesForRetry(messages: ChatHistoryItem[]): ChatHistoryItem[] {
+  const maxToolBytes = 12_000;
+  return messages.map((m) => {
+    if (m.role !== 'tool') return m;
+    const text = contentToText(m.content);
+    if (Buffer.byteLength(text, 'utf8') <= maxToolBytes) return m;
+    return { ...m, content: truncateMiddle(text, maxToolBytes) } satisfies ChatHistoryItem;
+  });
+}
+
+function flattenToolHistoryMessages(messages: ChatHistoryItem[]): ChatHistoryItem[] {
+  return messages.map((m) => {
+    const text = contentToText(m.content);
+    if (m.role === 'tool') {
+      return {
+        role: 'user',
+        content: `<tool_result tool_call_id="${m.tool_call_id ?? ''}">\n${text}\n</tool_result>`,
+      } satisfies ChatHistoryItem;
+    }
+    if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
+      const calls = m.tool_calls
+        .map((tc) => `<assistant_tool_call id="${tc.id}" name="${tc.name}">${tc.arguments}</assistant_tool_call>`)
+        .join('\n');
+      return {
+        role: 'assistant',
+        content: text ? `${text}\n${calls}` : calls,
+      } satisfies ChatHistoryItem;
+    }
+    if (m.role === 'system') return m;
+    return { role: m.role, content: text } satisfies ChatHistoryItem;
+  });
+}
+
+function latestUserMessage(messages: ChatHistoryItem[]): ChatHistoryItem | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === 'user') return messages[i];
+  }
+  return undefined;
+}
+
+function plannerDraftContext(messages: ChatHistoryItem[]): string {
+  const ids = new Set<string>();
+  for (const m of messages) {
+    if (m.role === 'tool' && typeof m.tool_call_id === 'string' && m.tool_call_id) ids.add(m.tool_call_id);
+  }
+  const parts: string[] = [];
+  for (const id of ids) {
+    const entry = plannerDraftByToolCallId.get(id);
+    if (entry) parts.push(`tool_call_id=${id}\n${entry.draft}`);
+  }
+  return parts.join('\n\n');
+}
+
+function buildToolCallTranslatorMessages(messages: ChatHistoryItem[], opusDraft: string, tailCount: number): ChatHistoryItem[] {
+  const context: ChatHistoryItem[] = flattenToolHistoryMessages(recentMessagesWithLatestUser(messages, tailCount));
+  return [
+    ...context,
+    {
+      role: 'user',
+      content:
+        `The requested model cannot emit native tool calls. It produced this planned next step:\n\n` +
+        `<opus_draft>\n${opusDraft}\n</opus_draft>\n\n` +
+        `Convert that planned next step into at most one native tool call.\n` +
+        `If the draft implies command execution, file read/edit/search, todo update, web fetch, or any tool action, call exactly the matching tool.\n` +
+        `If the draft says it lacks build commands, paths, files, current status, logs, or other inspectable facts, call an appropriate inspection tool instead of returning NO_TOOL.\n` +
+        `If the latest user asks to build, flash, test, inspect, continue work, or verify hardware/logs, prefer a tool call when any available tool can make progress.\n` +
+        `Return exactly NO_TOOL only when the draft is already a final user-facing answer or no available tool can make progress.\n` +
+        `Do not answer the user. Do not add commentary.`,
+    },
+  ];
+}
+
+function buildToolResultMessages(messages: ChatHistoryItem[], config: TextOnlyToolConfig): ChatHistoryItem[] {
+  const draftContext = plannerDraftContext(messages);
+  if (!draftContext) return messages;
+
+  const injected: ChatHistoryItem = {
+    role: 'system',
+    content:
+      `Previous Opus planner draft(s) that led to the tool result(s) in this turn:\n` +
+      `${draftContext}\n\nUse this to interpret the tool result and continue from the original plan.`,
+  };
+
+  if (config.toolResultContext === 'full') return [...messages, injected];
+
+  const tailCount = config.toolResultContext === 'minimal' ? 6 : config.toolResultContextMessages;
+  const context = flattenToolHistoryMessages(recentMessagesWithLatestUser(messages, tailCount));
+  return [...context, injected];
+}
+
+function shouldCallToolTranslator(draft: string, mode: ToolIntentDetectionMode): boolean {
+  if (mode === 'always') return true;
+  if (/\bTOOL_INTENT\s*:/i.test(draft)) return true;
+  if (mode === 'marker') return false;
+  return /\b(?:I'll|I will|let me|now|next I'll|I need to)\s+(?:run|execute|read|inspect|check|edit|search|grep|build|flash|capture|write|update)\b/i.test(draft);
+}
+
+function hasToolResultMessages(messages: ChatHistoryItem[]): boolean {
+  return messages.some((m) => m.role === 'tool');
+}
+
+function syntheticBashToolCallFromDraft(draft: string, tools: CloudToolDef[]): CloudChatEvent[] | undefined {
+  if (!tools.some((t) => t.name === 'bash')) return undefined;
+
+  const command =
+    draft.match(/<parameter\s+name=["']command["']>([\s\S]*?)(?:<\/parameter>|$)/i)?.[1]?.trim() ??
+    draft.match(/```tool\s*\n\s*bash\s*:\s*([\s\S]*?)```/i)?.[1]?.trim() ??
+    draft.match(/\bTOOL_INTENT\s*:[^\n]*\bbash\b[^\n`]*`([^`]+)`/i)?.[1]?.trim();
+
+  if (!command) return undefined;
+
+  const workdir =
+    draft.match(/\bworkdir\b\s*`([^`]+)`/i)?.[1] ??
+    draft.match(/\bworkdir\b\s*["']([^"']+)["']/i)?.[1];
+  const timeoutSeconds = Number(draft.match(/\btimeout\b\s*(\d+)\s*s\b/i)?.[1]);
+  const args: Record<string, unknown> = {
+    command,
+    description: 'Run planned command',
+  };
+  if (workdir) args.workdir = workdir;
+  if (Number.isFinite(timeoutSeconds) && timeoutSeconds > 0) args.timeout = timeoutSeconds * 1000;
+
+  const id = `call_${crypto.randomBytes(12).toString('hex')}`;
+  return [
+    { kind: 'tool_call_start', id, name: 'bash' },
+    { kind: 'tool_call_args', id, argsDelta: JSON.stringify(args) },
+    { kind: 'finish', reason: 'tool_calls' },
+  ];
+}
+
+function combinedUsageEvent(...eventGroups: CloudChatEvent[][]): CloudChatEvent | undefined {
+  const usageEvents = eventGroups.flat().filter((ev): ev is Extract<CloudChatEvent, { kind: 'usage' }> => ev.kind === 'usage');
+  if (usageEvents.length === 0) return undefined;
+  const sum = (key: keyof Omit<Extract<CloudChatEvent, { kind: 'usage' }>, 'kind'>): number | undefined => {
+    let total = 0;
+    let seen = false;
+    for (const ev of usageEvents) {
+      const value = ev[key];
+      if (typeof value === 'number') {
+        total += value;
+        seen = true;
+      }
+    }
+    return seen ? total : undefined;
+  };
+  return {
+    kind: 'usage',
+    promptTokens: sum('promptTokens'),
+    completionTokens: sum('completionTokens'),
+    totalTokens: sum('totalTokens'),
+    cachedInputTokens: sum('cachedInputTokens'),
+    cacheCreationInputTokens: sum('cacheCreationInputTokens'),
+    reasoningTokens: sum('reasoningTokens'),
+  };
+}
 
 /**
  * Map an opencode/OpenAI-shaped chat message into the ChatHistoryItem the
@@ -203,7 +582,6 @@ function createStreamingResponse(
           description: t.function?.description ?? '',
           parameters: t.function?.parameters ?? {},
         }));
-
         const { streamChatEvents } = await import('./cloud-direct/index.js');
         // Cloud-direct accepts the FULL @ai-sdk multimodal content shape
         // (text + image_url parts). We pass `request.messages` straight
@@ -225,7 +603,20 @@ function createStreamingResponse(
         let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | null = null;
         let firstChunkSent = false;
         const t0 = Date.now();
-        debugLog.log(`[windsurf-plugin] streamChatEvents starting (model=${resolved.modelUid}, msgs=${multimodalMessages.length}, tools=${tools.length})`);
+        const toolConfig = resolveToolConfig(request.providerOptions);
+        const useTranslator = !!resolved.textOnly && tools.length > 0;
+        const translator = useTranslator ? getToolCallTranslatorModel(request.providerOptions) : undefined;
+        const shouldReduceToolResultContext = useTranslator && hasToolResultMessages(multimodalMessages);
+        const passthroughMessages = multimodalMessages;
+        const resultMessages = shouldReduceToolResultContext
+          ? buildToolResultMessages(multimodalMessages, toolConfig)
+          : multimodalMessages;
+        debugLog.log(`[windsurf-plugin] streamChatEvents starting (model=${resolved.modelUid}, plannerMsgs=${passthroughMessages.length}, resultMsgs=${resultMessages.length}, tools=${useTranslator ? 0 : tools.length}, toolCallTranslator=${translator?.modelUid ?? 'none'}, intent=${toolConfig.toolIntentDetection}, resultContext=${shouldReduceToolResultContext ? `${toolConfig.toolResultContext}:${toolConfig.toolResultContextMessages}` : 'passthrough'})`);
+        if (debugLog.enabled) {
+          debugLog.log(`[windsurf-plugin] ${messageByteSummary(passthroughMessages, 'planner')}`);
+          if (resultMessages !== passthroughMessages) debugLog.log(`[windsurf-plugin] ${messageByteSummary(resultMessages, 'result')}`);
+        }
+        if (shouldReduceToolResultContext) debugLog.log(`[windsurf-plugin] reduced result context roles=${roleOrder(resultMessages)}`);
         let eventCount = 0;
         let textBytes = 0;
         // Thread the caller's `max_tokens` into the proto's
@@ -246,17 +637,113 @@ function createStreamingResponse(
           typeof request.max_tokens === 'number' && request.max_tokens > 0
             ? request.max_tokens
             : 128_000;
-        for await (const ev of streamChatEvents({
-          apiKey: credentials.apiKey,
-          apiServerUrl: credentials.apiServerUrl,
-          modelUid: resolved.modelUid,
-          messages: multimodalMessages,
-          tools: tools.length > 0 ? tools : undefined,
-          signal: abort.signal,
-          completionOpts: {
-            maxOutputTokens: requestedMaxTokens,
-          },
-        })) {
+
+        const eventSource = async function* (): AsyncGenerator<CloudChatEvent> {
+          const common = {
+            apiKey: credentials.apiKey,
+            apiServerUrl: credentials.apiServerUrl,
+            signal: abort.signal,
+            completionOpts: { maxOutputTokens: requestedMaxTokens },
+          };
+
+          if (!useTranslator || !translator) {
+            yield* streamChatEvents({
+              ...common,
+              modelUid: resolved.modelUid,
+              messages: passthroughMessages,
+              tools: tools.length > 0 ? tools : undefined,
+            });
+            return;
+          }
+
+          let opusEvents: CloudChatEvent[] = [];
+          let opusDraft = '';
+          try {
+            for await (const ev of streamChatEvents({
+              ...common,
+              modelUid: resolved.modelUid,
+              messages: buildOpusToolPlanningMessages(passthroughMessages, tools),
+            })) {
+              opusEvents.push(ev);
+              if (ev.kind === 'text') opusDraft += ev.text;
+            }
+          } catch (error) {
+            if (!isSocketClosedError(error)) throw error;
+            const retryMessages = compactOversizedToolMessagesForRetry(passthroughMessages);
+            debugLog.log(`[windsurf-plugin] opus planner socket closed; retrying with compacted oversized tool outputs (${messageByteSummary(retryMessages, 'plannerRetry')})`);
+            opusEvents = [];
+            opusDraft = '';
+            for await (const ev of streamChatEvents({
+              ...common,
+              modelUid: resolved.modelUid,
+              messages: buildOpusToolPlanningMessages(retryMessages, tools),
+            })) {
+              opusEvents.push(ev);
+              if (ev.kind === 'text') opusDraft += ev.text;
+            }
+          }
+
+          debugLog.log(`[windsurf-plugin] opus planner draft (${opusDraft.length}B): ${opusDraft.slice(0, 500).replace(/\n/g, '\\n')}`);
+
+          if (!shouldCallToolTranslator(opusDraft, toolConfig.toolIntentDetection)) {
+            debugLog.log(`[windsurf-plugin] tool-call translator skipped by detection=${toolConfig.toolIntentDetection}`);
+            for (const ev of opusEvents) yield ev;
+            return;
+          }
+
+          let fallbackSawTool = false;
+          const fallbackEvents: CloudChatEvent[] = [];
+          const translatorMessages = buildToolCallTranslatorMessages(multimodalMessages, opusDraft, toolConfig.toolTranslatorContextMessages);
+          debugLog.log(`[windsurf-plugin] translator context roles=${roleOrder(translatorMessages)}`);
+          for await (const ev of streamChatEvents({
+            ...common,
+            modelUid: translator.modelUid,
+            messages: translatorMessages,
+            tools,
+          })) {
+            fallbackEvents.push(ev);
+            if (ev.kind === 'tool_call_start') fallbackSawTool = true;
+          }
+
+          if (fallbackSawTool) {
+            debugLog.log(`[windsurf-plugin] tool-call translator model=${translator.modelUid} emitted tool call(s)`);
+            for (const ev of fallbackEvents) {
+              if (ev.kind === 'tool_call_start') {
+                storePlannerDraft(ev.id, { draft: opusDraft, modelUid: resolved.modelUid });
+                debugLog.log(`[windsurf-plugin] stored opus planner draft for tool_call_id=${ev.id}`);
+              }
+              if (ev.kind === 'text' || ev.kind === 'reasoning' || ev.kind === 'usage') continue;
+              yield ev;
+            }
+            const usage = combinedUsageEvent(opusEvents, fallbackEvents);
+            debugLog.log(`[windsurf-plugin] bridge usage ${usageSummary(opusEvents, 'planner')} ${usageSummary(fallbackEvents, 'translator')} combined=${usage ? JSON.stringify(usage) : 'none'}`);
+            if (usage) yield usage;
+            return;
+          }
+
+          const syntheticToolCall = syntheticBashToolCallFromDraft(opusDraft, tools);
+          if (syntheticToolCall) {
+            debugLog.log('[windsurf-plugin] synthesized bash tool call from opus draft after translator emitted no tool');
+            for (const ev of syntheticToolCall) {
+              if (ev.kind === 'tool_call_start') storePlannerDraft(ev.id, { draft: opusDraft, modelUid: resolved.modelUid });
+              yield ev;
+            }
+            const usage = combinedUsageEvent(opusEvents, fallbackEvents);
+            debugLog.log(`[windsurf-plugin] bridge usage ${usageSummary(opusEvents, 'planner')} ${usageSummary(fallbackEvents, 'translator')} combined=${usage ? JSON.stringify(usage) : 'none'}`);
+            if (usage) yield usage;
+            return;
+          }
+
+          debugLog.log(`[windsurf-plugin] tool-call translator model=${translator.modelUid} emitted no tool call; streaming opus draft`);
+          for (const ev of opusEvents) {
+            if (ev.kind !== 'usage') yield ev;
+          }
+          const usage = combinedUsageEvent(opusEvents, fallbackEvents);
+          debugLog.log(`[windsurf-plugin] bridge usage ${usageSummary(opusEvents, 'planner')} ${usageSummary(fallbackEvents, 'translator')} combined=${usage ? JSON.stringify(usage) : 'none'}`);
+          if (usage) yield usage;
+        };
+
+        for await (const ev of eventSource()) {
           eventCount++;
           if (eventCount === 1) debugLog.log(`[windsurf-plugin] streamChatEvents first event after ${Date.now() - t0}ms (kind=${ev.kind})`);
           // @ai-sdk expects `delta.role: 'assistant'` on the *first* chunk
@@ -466,7 +953,6 @@ async function createNonStreamingResponse(
     description: t.function?.description ?? '',
     parameters: t.function?.parameters ?? {},
   }));
-
   const multimodalMessages: ChatHistoryItem[] = request.messages.map((m) => mapMessageToHistoryItem(m));
 
   const { streamChatEvents } = await import('./cloud-direct/index.js');
@@ -487,21 +973,116 @@ async function createNonStreamingResponse(
   type CollectedToolCall = { id: string; name: string; args: string };
   const collectedToolCalls: CollectedToolCall[] = [];
   let currentToolCall: CollectedToolCall | null = null;
+  const toolConfig = resolveToolConfig(request.providerOptions);
+  const useTranslator = !!resolved.textOnly && tools.length > 0;
+  const translator = useTranslator ? getToolCallTranslatorModel(request.providerOptions) : undefined;
+  const shouldReduceToolResultContext = useTranslator && hasToolResultMessages(multimodalMessages);
+  const passthroughMessages = multimodalMessages;
+  const resultMessages = shouldReduceToolResultContext
+    ? buildToolResultMessages(multimodalMessages, toolConfig)
+    : multimodalMessages;
+  debugLog.log(`[windsurf-plugin] nonstream ChatEvents starting (model=${resolved.modelUid}, plannerMsgs=${passthroughMessages.length}, resultMsgs=${resultMessages.length}, tools=${useTranslator ? 0 : tools.length}, toolCallTranslator=${translator?.modelUid ?? 'none'}, intent=${toolConfig.toolIntentDetection}, resultContext=${shouldReduceToolResultContext ? `${toolConfig.toolResultContext}:${toolConfig.toolResultContextMessages}` : 'passthrough'})`);
 
-  for await (const ev of streamChatEvents({
-    apiKey: credentials.apiKey,
-    apiServerUrl: credentials.apiServerUrl,
-    modelUid: resolved.modelUid,
-    messages: multimodalMessages,
-    tools: tools.length > 0 ? tools : undefined,
-    completionOpts: {
-      maxOutputTokens: requestedMaxTokens,
-    },
-    // Propagate the caller's abort so a client disconnect during a
-    // non-streaming title-gen / summary call actually stops the upstream
-    // cloud request and the billable token usage with it.
-    signal,
-  })) {
+  const eventSource = async function* (): AsyncGenerator<CloudChatEvent> {
+    const common = {
+      apiKey: credentials.apiKey,
+      apiServerUrl: credentials.apiServerUrl,
+      completionOpts: { maxOutputTokens: requestedMaxTokens },
+      // Propagate the caller's abort so a client disconnect during a
+      // non-streaming title-gen / summary call actually stops the upstream
+      // cloud request and the billable token usage with it.
+      signal,
+    };
+
+    if (!useTranslator || !translator) {
+      yield* streamChatEvents({
+        ...common,
+        modelUid: resolved.modelUid,
+        messages: passthroughMessages,
+        tools: tools.length > 0 ? tools : undefined,
+      });
+      return;
+    }
+
+    let opusEvents: CloudChatEvent[] = [];
+    let opusDraft = '';
+    try {
+      for await (const ev of streamChatEvents({
+        ...common,
+        modelUid: resolved.modelUid,
+        messages: buildOpusToolPlanningMessages(passthroughMessages, tools),
+      })) {
+        opusEvents.push(ev);
+        if (ev.kind === 'text') opusDraft += ev.text;
+      }
+    } catch (error) {
+      if (!isSocketClosedError(error)) throw error;
+      const retryMessages = compactOversizedToolMessagesForRetry(passthroughMessages);
+      debugLog.log(`[windsurf-plugin] nonstream opus planner socket closed; retrying with compacted oversized tool outputs (${messageByteSummary(retryMessages, 'plannerRetry')})`);
+      opusEvents = [];
+      opusDraft = '';
+      for await (const ev of streamChatEvents({
+        ...common,
+        modelUid: resolved.modelUid,
+        messages: buildOpusToolPlanningMessages(retryMessages, tools),
+      })) {
+        opusEvents.push(ev);
+        if (ev.kind === 'text') opusDraft += ev.text;
+      }
+    }
+
+    if (!shouldCallToolTranslator(opusDraft, toolConfig.toolIntentDetection)) {
+      for (const ev of opusEvents) yield ev;
+      return;
+    }
+
+    let fallbackSawTool = false;
+    const fallbackEvents: CloudChatEvent[] = [];
+    const translatorMessages = buildToolCallTranslatorMessages(multimodalMessages, opusDraft, toolConfig.toolTranslatorContextMessages);
+    for await (const ev of streamChatEvents({
+      ...common,
+      modelUid: translator.modelUid,
+      messages: translatorMessages,
+      tools,
+    })) {
+      fallbackEvents.push(ev);
+      if (ev.kind === 'tool_call_start') fallbackSawTool = true;
+    }
+
+    if (fallbackSawTool) {
+      for (const ev of fallbackEvents) {
+        if (ev.kind === 'tool_call_start') {
+          storePlannerDraft(ev.id, { draft: opusDraft, modelUid: resolved.modelUid });
+        }
+        if (ev.kind === 'text' || ev.kind === 'reasoning' || ev.kind === 'usage') continue;
+        yield ev;
+      }
+      const usage = combinedUsageEvent(opusEvents, fallbackEvents);
+      if (usage) yield usage;
+      return;
+    }
+
+    const syntheticToolCall = syntheticBashToolCallFromDraft(opusDraft, tools);
+    if (syntheticToolCall) {
+      for (const ev of syntheticToolCall) {
+        if (ev.kind === 'tool_call_start') {
+          storePlannerDraft(ev.id, { draft: opusDraft, modelUid: resolved.modelUid });
+        }
+        yield ev;
+      }
+      const usage = combinedUsageEvent(opusEvents, fallbackEvents);
+      if (usage) yield usage;
+      return;
+    }
+
+    for (const ev of opusEvents) {
+      if (ev.kind !== 'usage') yield ev;
+    }
+    const usage = combinedUsageEvent(opusEvents, fallbackEvents);
+    if (usage) yield usage;
+  };
+
+  for await (const ev of eventSource()) {
     if (ev.kind === 'text') {
       collected += ev.text;
     } else if (ev.kind === 'tool_call_start') {
@@ -829,11 +1410,15 @@ async function ensureWindsurfProxyServer(): Promise<string> {
             object: 'list',
             data: models.map((id) => {
               const variants = getModelVariants(id);
+              const resolved = resolveModel(id);
+              const supportsTools = !resolved.textOnly;
               return {
                 id,
                 object: 'model',
                 created: Math.floor(Date.now() / 1000),
                 owned_by: 'windsurf',
+                capabilities: { tools: supportsTools },
+                text_only: !supportsTools,
                 ...(variants
                   ? {
                       variants: Object.entries(variants).map(([name, meta]) => ({

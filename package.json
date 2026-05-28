@@ -1,6 +1,6 @@
 {
   "name": "opencode-windsurf-auth",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "OpenCode plugin for Windsurf/Codeium authentication - use Windsurf models in OpenCode",
   "repository": {
     "type": "git",
